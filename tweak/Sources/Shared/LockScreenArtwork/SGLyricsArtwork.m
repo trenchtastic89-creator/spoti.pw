@@ -473,19 +473,11 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
 
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-    format.scale = 1;
-    format.opaque = YES;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(w, h) format:format];
-
     NSInteger frames = MAX(1, (NSInteger)llround(seconds * fps));
     BOOL ok = YES;
     for (NSInteger frame = 0; frame < frames && ok; frame++) {
         @autoreleasepool {
             NSTimeInterval t = frame / fps;
-            UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-                draw(context.CGContext, t);
-            }];
             CVPixelBufferRef buffer = NULL;
             if (adaptor.pixelBufferPool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, adaptor.pixelBufferPool, &buffer);
             if (!buffer) {
@@ -497,14 +489,20 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
             CGContextRef c = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buffer), w, h, 8,
                 CVPixelBufferGetBytesPerRow(buffer), space, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
             if (c) {
-                // Drawn straight in: a bitmap context already puts the image the right way up, and
-                // turning it over here is what had the whole clip upside down on the lock screen.
-                CGContextDrawImage(c, CGRectMake(0, 0, w, h), image.CGImage);
+                // The block lays out the way UIKit does, from the top down. A bitmap context's own space
+                // runs bottom up, so it is turned over here rather than over the finished picture: the
+                // frame goes straight into the buffer instead of through an image the size of the
+                // screen that exists for one blit.
+                CGContextTranslateCTM(c, 0, h);
+                CGContextScaleCTM(c, 1, -1);
+                draw(c, t);
                 CGContextRelease(c);
+            } else {
+                ok = NO;
             }
             CGColorSpaceRelease(space);
             CVPixelBufferUnlockBaseAddress(buffer, 0);
-            if (![adaptor appendPixelBuffer:buffer withPresentationTime:CMTimeMakeWithSeconds(t, 600)]) ok = NO;
+            if (ok && ![adaptor appendPixelBuffer:buffer withPresentationTime:CMTimeMakeWithSeconds(t, 600)]) ok = NO;
             CVPixelBufferRelease(buffer);
             // Left as it is, this runs flat out on the render queue and starves the audio thread;
             // a couple of milliseconds between frames costs a fraction of a second over the clip.
