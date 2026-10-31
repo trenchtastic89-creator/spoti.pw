@@ -26,6 +26,9 @@ NSString *SGAnimatedArtworkKey(CGFloat *aspect);
 // two switches it answers to, and the way back to the track's own artwork.
 void SGArtworkApplyLocal(NSString *identifier, NSURL *file, UIImage *still);
 void SGArtworkReload(void);
+// Whether the lock screen is holding any animated clip at all: a fetched Canvas, an album's cover,
+// or one this build made. The star's fallback only runs while this is NO.
+BOOL SGArtworkClipReady(void);
 extern NSString *const SGLyricsArtworkKey;
 extern NSString *const SGLyricsStarKey;
 // `artwork` under `key` in a copy of `info`, everything else left as it stands. The lock screen

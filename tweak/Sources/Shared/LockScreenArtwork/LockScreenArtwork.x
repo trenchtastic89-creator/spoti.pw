@@ -297,3 +297,9 @@ void SGArtworkReload(void) {
     if (track) resolve(track);
     resend();
 }
+
+BOOL SGArtworkClipReady(void) {
+    @synchronized (sg_lock) {
+        return sg_artwork != nil && sg_key != nil;
+    }
+}

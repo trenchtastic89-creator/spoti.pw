@@ -55,6 +55,8 @@ static NSInteger sg_lastPosition;
 static NSMutableDictionary<NSString *, NSDictionary *> *sg_cache;
 static NSMutableSet<NSString *> *sg_pending;   // clips being encoded, so one is never asked for twice
 static BOOL sg_ownArtwork;      // the star has been tapped: show the track's artwork, not the line
+static NSString *sg_driftFor;   // the track whose cover is being drawn instead of a Canvas
+static CFTimeInterval sg_ownAt; // when the star was tapped, so the Canvas has a moment to land
 static NSUInteger sg_generation;
 
 // One word of a line, in page points: where its box sits, how far along the line's sweep it starts,
@@ -472,6 +474,56 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     return YES;
 }
 
+#pragma mark - the star's other side
+
+// A track with no Canvas and no album cover on Apple Music leaves the lock screen holding a plain
+// sleeve, which reads as the toggle doing nothing. Chroma answers that with artwork of its own, and
+// so does this: the sleeve filled to the frame, breathing a few percent and drifting a hair, once
+// round in twelve seconds so the loop has no seam. Only built when neither source had a clip.
+static NSDictionary *makeDriftClip(NSString *track, CGSize size) {
+    UIImage *cover = coverImage(size);
+    if (!cover || cover.size.width < 1 || cover.size.height < 1) return nil;
+    NSURL *file = clipURL([NSString stringWithFormat:@"drift-%@", track]);
+    NSTimeInterval seconds = 12;
+    BOOL have = [NSFileManager.defaultManager fileExistsAtPath:file.path];
+    if (!have) {
+        have = writeClip(file, size, seconds, kFPS, ^(CGContextRef c, NSTimeInterval t) {
+            double turn = t / seconds * 2 * M_PI;
+            CGFloat zoom = 1.05 + 0.035 * sin(turn - M_PI_2);
+            CGFloat dx = size.width * 0.010 * sin(turn);
+            CGFloat dy = size.height * 0.008 * sin(turn + 1.3);
+            CGFloat scale = MAX(size.width / cover.size.width, size.height / cover.size.height) * zoom;
+            CGSize drawn = CGSizeMake(cover.size.width * scale, cover.size.height * scale);
+            [[UIColor blackColor] setFill];
+            CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
+            [cover drawInRect:CGRectMake((size.width - drawn.width) / 2 + dx,
+                                         (size.height - drawn.height) / 2 + dy,
+                                         drawn.width, drawn.height)];
+
+            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+            NSArray *stops = @[(id)[UIColor colorWithWhite:0 alpha:0].CGColor,
+                               (id)[UIColor colorWithWhite:0 alpha:0.55].CGColor];
+            CGGradientRef gradient = CGGradientCreateWithColors(space, (__bridge CFArrayRef)stops, NULL);
+            if (gradient) {
+                CGContextDrawLinearGradient(c, gradient, CGPointMake(0, size.height * 0.45),
+                                            CGPointMake(0, size.height), 0);
+                CGGradientRelease(gradient);
+            }
+            NSArray *edges = @[(id)[UIColor colorWithWhite:0 alpha:0].CGColor,
+                               (id)[UIColor colorWithWhite:0 alpha:0.45].CGColor];
+            CGGradientRef vignette = CGGradientCreateWithColors(space, (__bridge CFArrayRef)edges, NULL);
+            if (vignette) {
+                CGPoint centre = CGPointMake(size.width / 2, size.height * 0.45);
+                CGContextDrawRadialGradient(c, vignette, centre, size.width * 0.20, centre, size.height * 0.60, 0);
+                CGGradientRelease(vignette);
+            }
+            CGColorSpaceRelease(space);
+        });
+    }
+    if (!have) return nil;
+    return @{@"file": file, @"still": cover};
+}
+
 #pragma mark - one clip
 
 // How many lines one clip covers: up to kSpanLines, but never so long that the wait before it can be
@@ -674,18 +726,58 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
 
 static void tick(void);
 
+// The star's other side: the track's own artwork. The Canvas and the album's cover are fetched by
+// the module that owns them, so all this does is wait for one of them and, when neither arrives,
+// put a moving sleeve there itself so the toggle never lands on a dead still.
+static void tickOwn(void) {
+    NSString *track = SGKaraokePlayingTrack();
+    if (!track.length) return;
+    CGFloat aspect = 0;
+    if (!SGAnimatedArtworkKey(&aspect) || aspect <= 0) return;
+    if (SGArtworkClipReady()) return;
+    if (sg_driftFor.length && ![sg_driftFor isEqualToString:track]) {
+        sg_driftFor = nil;
+        sg_ownAt = CACurrentMediaTime();
+    }
+    if (sg_driftFor.length) return;
+    if (sg_ownAt <= 0) {
+        sg_ownAt = CACurrentMediaTime();
+        return;
+    }
+    if (CACurrentMediaTime() - sg_ownAt < 1.2) return;
+
+    sg_driftFor = [track copy];
+    CGSize size = CGSizeMake(round(1920 * aspect), 1920);
+    dispatch_async(sg_queue, ^{
+        @autoreleasepool {
+            NSDictionary *entry = makeDriftClip(track, size);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!entry || !sg_ownArtwork) return;
+                if (![track isEqualToString:SGKaraokePlayingTrack() ?: @""]) return;
+                if (SGArtworkClipReady()) return;   // a real Canvas landed while this was being drawn
+                NSString *identifier = [NSString stringWithFormat:@"drift-%@-%lu", track, (unsigned long)++sg_generation];
+                SGArtworkApplyLocal(identifier, entry[@"file"], entry[@"still"]);
+                SGLog(@"lyrics artwork: no clip for %@, the cover drifts instead", track);
+            });
+        }
+    });
+}
+
 static void swapMode(void) {
     sg_ownArtwork = !sg_ownArtwork;
     sg_spanFirst = -1;
     sg_generation++;
+    sg_driftFor = nil;
+    sg_ownAt = sg_ownArtwork ? CACurrentMediaTime() : 0;
     SGArtworkReload();
     if (!sg_ownArtwork) tick();
     SGLog(@"lyrics artwork: %@", sg_ownArtwork ? @"the track's own artwork" : @"back to the line");
 }
 
 static void tick(void) {
-    if (sg_ownArtwork) return;
-    if (!SGFlag(SGKeyLockScreenArtwork, YES) || !SGFlag(SGLyricsArtworkKey, YES)) return;
+    if (!SGFlag(SGKeyLockScreenArtwork, YES)) return;
+    if (sg_ownArtwork) { tickOwn(); return; }
+    if (!SGFlag(SGLyricsArtworkKey, YES)) return;
     NSString *track = SGKaraokePlayingTrack();
     if (!track.length) return;
     if (![track isEqualToString:sg_track ?: @""]) {
