@@ -242,12 +242,16 @@ static NSArray<SGKaraokeWord *> *timedWords(SGKaraokeLine *line) {
     return words;
 }
 
-// Lays the words into rows as wide as the page. Each box is in page points; `flow` runs the whole
-// line end to end, so the feather's travel across a row break is the same arithmetic as within one.
+// Lays the words into rows as wide as the page, each row centred in it. Each box is in page points;
+// `flow` runs along the line's own text end to end, so the feather's travel across a row break is the
+// same arithmetic as within one.
 static NSData *layoutWords(NSArray<SGKaraokeWord *> *words, UIFont *font, CGFloat width, CGFloat *outHeight) {
     NSMutableData *data = [NSMutableData data];
+    NSMutableArray<NSNumber *> *rowStarts = [NSMutableArray arrayWithObject:@0];
     CGFloat space = ceil([@" " sizeWithAttributes:@{NSFontAttributeName: font}].width);
-    CGFloat row = ceil(font.lineHeight) - 2;
+    // A row is exactly a line high. Spacing them two points closer let the lit copy of one row reach
+    // into the tops of the next, which is what put a second line's letters under the first's fill.
+    CGFloat row = ceil(font.lineHeight);
     CGFloat high = ceil(font.lineHeight);
     CGFloat x = 0, y = 0, flow = 0;
     for (NSUInteger i = 0; i < words.count; i++) {
@@ -256,10 +260,15 @@ static NSData *layoutWords(NSArray<SGKaraokeWord *> *words, UIFont *font, CGFloa
         if (w < 1) w = 1;
         CGFloat lead = (i == 0 || word.joined) ? 0 : space;
         if (i > 0 && x + lead + w > width) {
-            flow += width - x;
+            // The sweep runs along the text that was written, so it advances by the row's content and
+            // not by the empty space left at the end of it. It used to add that gap, which put every
+            // word of a wrapped row further along the cursor than it really was: the second row of a
+            // two-line lyric lit up while the first was still being sung.
+            flow += x;
             y += row;
             x = 0;
             lead = 0;
+            [rowStarts addObject:@(i)];
         }
         SGWordBox box;
         box.x = x + lead;
@@ -272,6 +281,20 @@ static NSData *layoutWords(NSArray<SGKaraokeWord *> *words, UIFont *font, CGFloa
         box.index = i;
         [data appendBytes:&box length:sizeof(box)];
         x += lead + w;
+    }
+
+    // Centre each row in the page. Only the drawing position moves: `flow` stays on the text's own
+    // ruler, so the feather still travels at the speed the words are sung.
+    SGWordBox *boxes = data.mutableBytes;
+    NSUInteger count = data.length / sizeof(SGWordBox);
+    for (NSUInteger r = 0; r < rowStarts.count; r++) {
+        NSUInteger first = rowStarts[r].unsignedIntegerValue;
+        NSUInteger last = (r + 1 < rowStarts.count) ? rowStarts[r + 1].unsignedIntegerValue : count;
+        if (last <= first || last > count) continue;
+        CGFloat left = boxes[first].x;
+        CGFloat right = boxes[last - 1].x + boxes[last - 1].w;
+        CGFloat shift = (width - (right - left)) / 2 - left;
+        for (NSUInteger k = first; k < last; k++) boxes[k].x += shift;
     }
     *outHeight = y + high;
     return data;
