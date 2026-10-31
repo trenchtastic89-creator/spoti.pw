@@ -338,7 +338,12 @@ static UIImage *lineImage(NSData *boxes, NSArray<NSString *> *texts, UIFont *fon
     format.opaque = NO;
     CGSize size = CGSizeMake(pageWidth * scale, height * scale + pad * 2 * scale);
     return [[[UIGraphicsImageRenderer alloc] initWithSize:size format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        drawLineWords(context.CGContext, boxes, texts, font, 0, pad * scale, scale, 0, 0, NULL, 1.0);
+        // A line that is not being sung sits at 0.97, anchored at the text edge it reads from, so it
+        // steps back without drifting off the margin.
+        CGContextRef c = context.CGContext;
+        CGContextTranslateCTM(c, kMargin * scale, pad * scale);
+        CGContextScaleCTM(c, kDimScale, kDimScale);
+        drawLineWords(c, boxes, texts, font, -kMargin * scale, 0, scale, 0, 0, NULL, 1.0);
     }];
 }
 
