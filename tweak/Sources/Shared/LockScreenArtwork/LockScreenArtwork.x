@@ -267,3 +267,19 @@ static SGArtworkWatcher *sg_watcher;
     SGRequireClasses(@[@"MPNowPlayingInfoCenter"]);
     SGLog(@"lock artwork: on");
 }
+
+// A clip made on the device (the lock screen lyrics' frames) under the animated artwork key, the
+// way a fetched Canvas goes there: the last dictionary is sent again so the system asks for this one.
+void SGArtworkApplyLocal(NSString *identifier, NSURL *file, UIImage *still) {
+    if (!identifier.length || !file) return;
+    if (!keyOffered()) return;
+    id artwork = artworkFor(identifier, file, still);
+    if (!artwork) return;
+    @synchronized (sg_lock) {
+        sg_artwork = artwork;
+        sg_key = sg_offered;
+    }
+    sg_playing = @"lyrics";
+    SGLog(@"lock artwork: %@ under %@", identifier, sg_offered);
+    resend();
+}

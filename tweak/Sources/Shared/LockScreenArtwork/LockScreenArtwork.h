@@ -4,6 +4,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
+@class UIImage;
+
 #define SGKeyLockScreenArtwork @"spotifyglass.lockscreen.animatedartwork"
 #define SGKeyLockScreenArtworkSources @"spotifyglass.lockscreen.artworksources"
 
@@ -20,6 +22,9 @@ BOOL SGAnimatedArtworkAvailable(void);
 // the shape it wants there through `aspect`; nil where there is none.
 NSArray<NSString *> *SGAnimatedArtworkKeys(void);
 NSString *SGAnimatedArtworkKey(CGFloat *aspect);
+// A clip made on the device (the lock screen lyrics' frames) put under the animated artwork key
+// the way a fetched Canvas is.
+void SGArtworkApplyLocal(NSString *identifier, NSURL *file, UIImage *still);
 // `artwork` under `key` in a copy of `info`, everything else left as it stands. The lock screen
 // lyrics rewrite the dictionary on a timer, so the key is put back on every one that passes.
 NSDictionary *SGArtworkInInfo(NSDictionary *info, id artwork, NSString *key);
