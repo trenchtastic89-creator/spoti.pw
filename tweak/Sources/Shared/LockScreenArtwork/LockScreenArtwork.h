@@ -29,6 +29,8 @@ void SGArtworkReload(void);
 // Whether the lock screen is holding any animated clip at all: a fetched Canvas, an album's cover,
 // or one this build made. The star's fallback only runs while this is NO.
 BOOL SGArtworkClipReady(void);
+// What the lock screen lyrics have done lately, newest last, for the row in Mod Settings.
+NSString *SGLyricsArtworkLog(void);
 extern NSString *const SGLyricsArtworkKey;
 extern NSString *const SGLyricsStarKey;
 // `artwork` under `key` in a copy of `info`, everything else left as it stands. The lock screen

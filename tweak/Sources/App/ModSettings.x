@@ -68,6 +68,11 @@ static UIViewController *modSettingsPage(void) {
         SGSection(nil, @[
             pageRow(@"All flags", @"flag", ^UIViewController *{ return SGAllFlagsPage(); }),
             mod,
+            // The lock screen lyrics run where only the phone can see them, so what they have
+            // done lately is one tap from the clipboard here.
+            SGWithSymbol(SGActionRow(@"Lock screen lyrics log", @"Copies the last few minutes to the clipboard", ^{
+                UIPasteboard.generalPasteboard.string = SGLyricsArtworkLog();
+            }), @"doc.text.magnifyingglass"),
         ]),
     ]];
     return [[SGModPage alloc] initWithTitle:@"spoti.pw" intro:nil sections:sections footer:nil];

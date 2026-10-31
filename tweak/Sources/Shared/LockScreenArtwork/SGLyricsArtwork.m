@@ -50,8 +50,7 @@ static const NSTimeInterval kShortest = 1.5;
 static const NSTimeInterval kLongest = 12;
 
 static dispatch_queue_t sg_queue;
-static NSString *sg_track;      // the track the cache belongs to
-static NSInteger sg_spanFirst = -1, sg_spanCount = 0;   // the clip the lock screen is showing
+static NSString *sg_track;      // the track the cache belongs tostatic NSInteger sg_spanFirst = -1, sg_spanCount = 0;   // the clip the lock screen is showing
 static NSInteger sg_started;    // where that clip's first frame sits on the track
 static CFTimeInterval sg_startedAt;   // and when it went up, so a seek can be caught
 static NSInteger sg_lastPosition;
@@ -70,6 +69,42 @@ typedef struct {
     NSInteger start, end;
     NSUInteger index;
 } SGWordBox;
+
+// What the module has done lately, for the row in Mod Settings: the phone is the only place this can
+// be watched from, and a clip that never lands looks the same as one that lands late.
+static NSMutableArray<NSString *> *sg_log;
+
+static NSObject *logLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+static void note(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *text = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    SGLog(@"lyrics artwork: %@", text);
+    static NSDateFormatter *stamp;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        stamp = [NSDateFormatter new];
+        stamp.dateFormat = @"HH:mm:ss.SSS";
+    });
+    @synchronized (logLock()) {
+        if (!sg_log) sg_log = [NSMutableArray array];
+        [sg_log addObject:[NSString stringWithFormat:@"%@  %@", [stamp stringFromDate:NSDate.date], text]];
+        while (sg_log.count > 400) [sg_log removeObjectAtIndex:0];
+    }
+}
+
+NSString *SGLyricsArtworkLog(void) {
+    @synchronized (logLock()) {
+        return sg_log.count ? [sg_log componentsJoinedByString:@"\n"] : @"nothing logged yet";
+    }
+}
 
 static NSURL *clipURL(NSString *identifier) {
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
@@ -376,14 +411,17 @@ static UIImage *blurred(UIImage *image, CGFloat radius) {
 #pragma mark - writing the clip
 
 // Writes the frames of one clip. `draw` gets a context already turned the right way up, so it can
-// lay out in UIKit coordinates from the top left.
+// lay out in UIKit coordinates from the top left. The file is written beside the real one and only
+// moved into place when the writer says it is complete: an app that is suspended or killed halfway
+// through would otherwise leave a clip the lock screen can open and never play.
 static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInterval fps,
                       void (^draw)(CGContextRef c, NSTimeInterval t)) {
-    [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+    NSURL *partial = [url URLByAppendingPathExtension:@"part"];
+    [NSFileManager.defaultManager removeItemAtURL:partial error:nil];
     NSError *error = nil;
-    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&error];
+    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:partial fileType:AVFileTypeMPEG4 error:&error];
     if (!writer) {
-        SGLog(@"lyrics artwork: writer: %@", error.localizedDescription);
+        note(@"writer: %@", error.localizedDescription);
         return NO;
     }
     size_t w = (size_t)(size.width) & ~1UL;
@@ -413,7 +451,7 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     if (![writer canAddInput:input]) return NO;
     [writer addInput:input];
     if (![writer startWriting]) {
-        SGLog(@"lyrics artwork: start: %@", writer.error.localizedDescription);
+        note(@"writer start: %@", writer.error.localizedDescription);
         return NO;
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
@@ -460,7 +498,8 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     [input markAsFinished];
     if (!ok) {
         [writer cancelWriting];
-        SGLog(@"lyrics artwork: frame dropped");
+        note(@"a frame was dropped");
+        [NSFileManager.defaultManager removeItemAtURL:partial error:nil];
         return NO;
     }
     [writer endSessionAtSourceTime:CMTimeMakeWithSeconds(seconds, 600)];
@@ -473,7 +512,14 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     }];
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     if (!finished) {
-        SGLog(@"lyrics artwork: finish %ld %@", (long)writer.status, writer.error.localizedDescription);
+        note(@"writer finish %ld %@", (long)writer.status, writer.error.localizedDescription);
+        [NSFileManager.defaultManager removeItemAtURL:partial error:nil];
+        return NO;
+    }
+    [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+    NSError *move = nil;
+    if (![NSFileManager.defaultManager moveItemAtURL:partial toURL:url error:&move]) {
+        note(@"could not put the clip in place: %@", move.localizedDescription);
         return NO;
     }
     return YES;
@@ -624,7 +670,10 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
 
     NSString *identifier = [NSString stringWithFormat:@"%@-%@-%ld-%ld", kClipTag, track, (long)first, (long)startMs];
     NSURL *file = clipURL(identifier);
-    BOOL have = [NSFileManager.defaultManager fileExistsAtPath:file.path];
+    // A file left behind by an older build, or by a write that was cut short, is not trusted: only
+    // one big enough to hold a clip is reused.
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:file.path error:nil];
+    BOOL have = attributes.fileSize > 20000;
 
     BOOL wrote = YES;
     if (!have) {
@@ -700,14 +749,15 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
                 if (words[i].end > words[i].start) { swept = YES; break; }
             }
             CGFloat y = (kAnchor * kPageHeight + tops[at].doubleValue - scroll - kPad) * scale;
-            drawSungLine(c, sharpLines[@(at)], boxes, y, scale, cursorAt(words, n, startMs), mask, swept, 1.0);
+            drawSungLine(c, sharpLines[@(at)], boxes, y, scale, 1e9, mask, swept, 1.0);
         }];
     }
     if (!poster) return nil;
     // Kept in memory for the rest of the track, so it is stored small: a full-height frame here is
     // 7 MB a stanza and the lock screen re-renders it into whatever size it asks for anyway.
     poster = smaller(poster, 480);
-    return @{@"file": file, @"still": poster, @"first": @(first), @"count": @(count), @"from": @(startMs)};
+    return @{@"file": file, @"still": poster, @"first": @(first), @"count": @(count),
+             @"from": @(startMs), @"seconds": @(seconds)};
 }
 
 // What the lock screen shows now: a rendered clip, under a fresh id so the system takes it.
@@ -731,17 +781,25 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
                   NSString *track, CGSize size, BOOL show) {
     // A phone that is already hot has no room for a hundred full-height frames on top of the audio.
     if (NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious) {
-        SGLog(@"lyrics artwork: too warm to draw another clip");
+        note(@"too warm to draw another clip");
         return;
     }
     NSString *key = clipKey(track, first, fromMs);
     [sg_pending addObject:key];
+    CFTimeInterval began = CACurrentMediaTime();
+    note(@"drawing %ld from %ld (%@)", (long)first, (long)fromMs, show ? @"needed" : @"ahead");
     dispatch_async(sg_queue, ^{
         @autoreleasepool {
             NSDictionary *entry = makeClip(lines, first, fromMs, track, size);
+            CFTimeInterval took = CACurrentMediaTime() - began;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [sg_pending removeObject:key];
-                if (!entry) return;
+                if (!entry) {
+                    note(@"clip %ld could not be made (%.1f s)", (long)first, took);
+                    return;
+                }
+                note(@"clip %ld ready in %.1f s for %@ s", (long)first, took,
+                     [entry[@"seconds"] stringValue] ?: @"?");
                 if (![track isEqualToString:sg_track ?: @""]) return;
                 if (fromMs <= 0) sg_cache[key] = entry;
                 // Only the clips either side of the playhead are ever wanted again.
@@ -751,7 +809,7 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
                     }
                 }
                 if (show && sg_spanFirst != first) {
-                    SGLog(@"lyrics artwork: from line %ld of %@", (long)first, track);
+                    note(@"applied %ld for %@", (long)first, track);
                     applyClip(entry, track);
                 }
             });
@@ -792,7 +850,7 @@ static void tickOwn(void) {
                 if (SGArtworkClipReady()) return;   // a real Canvas landed while this was being drawn
                 NSString *identifier = [NSString stringWithFormat:@"drift-%@-%lu", track, (unsigned long)++sg_generation];
                 SGArtworkApplyLocal(identifier, entry[@"file"], entry[@"still"]);
-                SGLog(@"lyrics artwork: no clip for %@, the cover drifts instead", track);
+                note(@"no clip for %@, the cover drifts instead", track);
             });
         }
     });
@@ -806,7 +864,7 @@ static void swapMode(void) {
     sg_ownAt = sg_ownArtwork ? CACurrentMediaTime() : 0;
     SGArtworkReload();
     if (!sg_ownArtwork) tick();
-    SGLog(@"lyrics artwork: %@", sg_ownArtwork ? @"the track's own artwork" : @"back to the line");
+    note(@"%@", sg_ownArtwork ? @"the track's own artwork" : @"back to the line");
 }
 
 static void tick(void) {
@@ -843,7 +901,7 @@ static void tick(void) {
     if (playing && sg_spanFirst >= 0) {
         double expect = sg_started + (CACurrentMediaTime() - sg_startedAt) * 1000.0;
         if (fabs(position - expect) > 2000) {
-            SGLog(@"lyrics artwork: seek to %ld", (long)position);
+            note(@"seek to %ld", (long)position);
             sg_spanFirst = -1;
             sg_spanCount = 0;
             NSString *key = clipKey(track, index, position);
@@ -865,7 +923,7 @@ static void tick(void) {
     NSString *key = clipKey(track, index, 0);
     NSDictionary *ready = sg_cache[key];
     if (ready) {
-        SGLog(@"lyrics artwork: line %ld of %@ (ready)", (long)index, track);
+        note(@"line %ld of %@ was ready", (long)index, track);
         applyClip(ready, track);
     } else if (![sg_pending containsObject:key]) {
         build(lines, index, 0, track, size, YES);
@@ -880,8 +938,10 @@ __attribute__((constructor)) static void SGLyricsArtworkStart(void) {
 
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        sg_queue = dispatch_queue_create("com.spotipw.lyricsartwork",
-            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        // Not UTILITY: a backgrounded app on that class is throttled so hard that a twelve second
+        // clip took minutes to draw and the words fell further behind with every stanza. The frames
+        // are a dozen blits now, so the burst is short enough at the default class.
+        sg_queue = dispatch_queue_create("com.spotipw.lyricsartwork", DISPATCH_QUEUE_SERIAL);
         sg_pending = [NSMutableSet set];
         dispatch_async(dispatch_get_main_queue(), ^{
             // The star on the lock screen is the like command; first in, so a tap lands here before
@@ -896,7 +956,7 @@ __attribute__((constructor)) static void SGLyricsArtworkStart(void) {
             }
             NSTimer *timer = [NSTimer timerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) { tick(); }];
             [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
-            SGLog(@"lyrics artwork: on");
+            note(@"on");
         });
     });
 }
