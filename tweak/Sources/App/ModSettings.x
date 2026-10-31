@@ -14,6 +14,7 @@
 //   UITableView bg #121212: header with an 11pt grey description at (16, 24), 53pt cells with the
 #import "Core/SGCore.h"
 #import "Shared/LockScreenArtwork/LockScreenArtwork.h"
+#import "Shared/SettingsBackup/SGSettingsBackup.h"
 #import "Settings/SGPage.h"
 #import "Settings/SGPageStyle.h"
 #import "Settings/SGModPage.h"
@@ -69,6 +70,24 @@ static UIViewController *modSettingsPage(void) {
         SGSection(nil, @[
             pageRow(@"All flags", @"flag", ^UIViewController *{ return SGAllFlagsPage(); }),
             mod,
+            // Settings live in the app's defaults, which an install replaces. The backup is in
+            // the keychain, which it does not, so a reinstall gets them all back on its own.
+            SGWithSymbol(SGActionRow(@"Settings backup", SGSettingsBackupSummary(), ^{
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Settings backup"
+                    message:@"Every switch, list and flag override, kept in this phone's keychain. A reinstall empties the app's files and leaves the keychain alone, so the next launch puts them all back."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Back up now" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                    SGSettingsBackupSave();
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Restore and restart" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+                    SGSettingsBackupRestore();
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Forget backup" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+                    SGSettingsBackupForget();
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+                [SGTopController() presentViewController:alert animated:YES completion:nil];
+            }), @"externaldrive.badge.checkmark"),
             // The lock screen lyrics run where only the phone can see them, so what they have
             // done lately is one tap from the clipboard here.
             SGWithSymbol(SGActionRow(@"Lock screen lyrics log", @"Copies the last few minutes to the clipboard", ^{
