@@ -13,6 +13,7 @@
 //   x 48, 12pt chevron on the right. A pushed page (trees/settings notifications opened.txt) is a
 //   UITableView bg #121212: header with an 11pt grey description at (16, 24), 53pt cells with the
 #import "Core/SGCore.h"
+#import "Shared/LockScreenArtwork/LockScreenArtwork.h"
 #import "Settings/SGPage.h"
 #import "Settings/SGPageStyle.h"
 #import "Settings/SGModPage.h"
