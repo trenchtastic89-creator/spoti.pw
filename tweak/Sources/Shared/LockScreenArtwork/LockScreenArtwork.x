@@ -283,3 +283,17 @@ void SGArtworkApplyLocal(NSString *identifier, NSURL *file, UIImage *still) {
     SGLog(@"lock artwork: %@ under %@", identifier, sg_offered);
     resend();
 }
+
+// The track's own artwork again, after one of those clips was put there: the key is dropped and
+// the source walk runs from the top, so a Canvas lands the way it would have without us.
+void SGArtworkReload(void) {
+    sg_wanted = nil;
+    sg_playing = nil;
+    @synchronized (sg_lock) {
+        sg_artwork = nil;
+        sg_key = nil;
+    }
+    SPTPlayerTrack *track = SGPlayerState().track;
+    if (track) resolve(track);
+    resend();
+}

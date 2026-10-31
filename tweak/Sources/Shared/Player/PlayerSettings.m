@@ -1,4 +1,5 @@
-// The player's settings that do not depend on the look: the lock screen widget's flags.
+// The player's settings that do not depend on the look: the lock screen widget's flags, and the two
+// rows the full-screen lyric artwork answers to.
 #import "Core/SGCore.h"
 #import "Settings/SGModPage.h"
 #import "PlayerSettings.h"
@@ -14,5 +15,11 @@ UIViewController *SGLockScreenWidgetPage(void) {
         ]),
         SGSection(@"Artwork", [SGAnimatedArtworkRows() arrayByAddingObject:
             SGFlagRow(@"Companion content", @"ios-feature-lockscreen.companion_content_enabled")]),
+        // The line drawn over the artwork is made by the mod rather than fetched, so it has switches
+        // of its own; Shared/LockScreenArtwork/SGLyricsArtwork reads both.
+        SGSection(@"Full-screen lyrics", @[
+            SGSwitchRow(@"Draw the line over the artwork", @"A clip is made for every line, for as long as the lock screen is awake", SGLyricsArtworkKey),
+            SGSwitchRow(@"Star button switches", @"Tap the like star on the lock screen to go between the line and the artwork", SGLyricsStarKey),
+        ]),
     ] footer:nil];
 }

@@ -8,12 +8,18 @@
 // The frame is Apple Music's: the artwork softened to a wash of its own colour, dimmed hard, and the
 // line centred in the upper half with the ones after it under it. Nothing of the photo survives but
 // the colour, which is what keeps white text readable over any cover.
+//
+// The star: Chroma's star on the lock screen is iOS's like button, so the mod listens on the like
+// command and swaps between the line and the track's own artwork instead of liking the song.
 #import <MediaPlayer/MediaPlayer.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import "Core/SGCore.h"
 #import "LockScreenArtwork.h"
 #import "Shared/Lyrics/Lyrics.h"
+
+NSString *const SGLyricsArtworkKey = @"spotifyglass.lockscreen.lyricsartwork";
+NSString *const SGLyricsStarKey = @"spotifyglass.lockscreen.modestar";
 
 static const NSTimeInterval kTick = 0.3;
 // A line is on screen for at least this long, so a clip is never empty.
@@ -26,6 +32,7 @@ static const NSUInteger kFollowing = 2;
 static dispatch_queue_t sg_queue;
 static NSString *sg_want;   // track|line the last clip was asked for
 static NSUInteger sg_generation;
+static BOOL sg_ownArtwork;  // the star has been tapped: show the track's artwork, not the line
 
 static NSURL *clipURL(NSString *identifier) {
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
@@ -76,11 +83,11 @@ static CGImageRef renderFrame(NSString *line, NSArray<NSString *> *following, CG
 
         // Dark enough that white reads at any screen brightness, and darker toward the bottom where
         // the controls sit, so the two never fight.
-        [[UIColor colorWithWhite:0 alpha:0.55] setFill];
+        [[UIColor colorWithWhite:0 alpha:0.50] setFill];
         CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
         CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-        NSArray *stops = @[(id)[UIColor colorWithWhite:0 alpha:0.30].CGColor,
-                           (id)[UIColor colorWithWhite:0 alpha:0.75].CGColor];
+        NSArray *stops = @[(id)[UIColor colorWithWhite:0 alpha:0.15].CGColor,
+                           (id)[UIColor colorWithWhite:0 alpha:0.70].CGColor];
         CGGradientRef gradient = CGGradientCreateWithColors(space, (__bridge CFArrayRef)stops, NULL);
         if (gradient) {
             CGContextDrawLinearGradient(c, gradient, CGPointMake(0, 0), CGPointMake(0, size.height), 0);
@@ -215,6 +222,22 @@ static BOOL writeClip(CGImageRef image, NSTimeInterval seconds, NSURL *url) {
     return YES;
 }
 
+static BOOL switchedOn(void) {
+    return SGFlag(SGKeyLockScreenArtwork, YES) && SGFlag(SGLyricsArtworkKey, YES);
+}
+
+static void tick(void);
+
+// The star was tapped: the other one of the two now owns the lock screen's artwork.
+static void swapMode(void) {
+    sg_ownArtwork = !sg_ownArtwork;
+    sg_want = nil;
+    sg_generation++;
+    SGArtworkReload();
+    if (!sg_ownArtwork) tick();
+    SGLog(@"lyrics artwork: %@", sg_ownArtwork ? @"the track's own artwork" : @"back to the line");
+}
+
 static void render(NSArray<SGKaraokeLine *> *lines, NSInteger index, NSString *track) {
     NSString *line = SGKaraokeLineText(lines[index]);
     NSMutableArray<NSString *> *following = [NSMutableArray array];
@@ -244,7 +267,7 @@ static void render(NSArray<SGKaraokeLine *> *lines, NSInteger index, NSString *t
             CGImageRelease(image);
             if (!wrote) return;
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (generation != sg_generation) return;
+                if (generation != sg_generation || sg_ownArtwork) return;
                 if (![SGKaraokePlayingTrack() isEqualToString:track]) return;
                 SGLog(@"lyrics artwork: line %ld of %@ (%.1fs)", (long)index, track, seconds);
                 SGArtworkApplyLocal(identifier, file, still);
@@ -254,7 +277,8 @@ static void render(NSArray<SGKaraokeLine *> *lines, NSInteger index, NSString *t
 }
 
 static void tick(void) {
-    if (!SGFlag(SGKeyLockScreenArtwork, YES)) return;
+    if (sg_ownArtwork) return;
+    if (!switchedOn()) return;
     NSString *track = SGKaraokePlayingTrack();
     if (!track.length) return;
     NSArray<SGKaraokeLine *> *lines = SGKaraokeLinesForTrack(track);
@@ -277,10 +301,25 @@ static void tick(void) {
 
 __attribute__((constructor)) static void SGLyricsArtworkStart(void) {
     if (!SGAnimatedArtworkAvailable()) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    // The rows are read with these defaults, so an untouched install shows what the mod does.
+    if ([defaults objectForKey:SGLyricsArtworkKey] == nil) [defaults setBool:YES forKey:SGLyricsArtworkKey];
+    if ([defaults objectForKey:SGLyricsStarKey] == nil) [defaults setBool:NO forKey:SGLyricsStarKey];
+
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         sg_queue = dispatch_queue_create("com.spotipw.lyricsartwork", DISPATCH_QUEUE_SERIAL);
         dispatch_async(dispatch_get_main_queue(), ^{
+            // The star on the lock screen is the like command; first in, so a tap lands here before
+            // Spotify's own handler and never likes the track.
+            MPRemoteCommand *like = MPRemoteCommandCenter.sharedCommandCenter.likeCommand;
+            if (like) {
+                [like addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+                    if (!SGFlag(SGLyricsStarKey, NO)) return MPRemoteCommandHandlerStatusCommandFailed;
+                    swapMode();
+                    return MPRemoteCommandHandlerStatusSuccess;
+                }];
+            }
             NSTimer *timer = [NSTimer timerWithTimeInterval:kTick repeats:YES block:^(NSTimer *t) { tick(); }];
             [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
             SGLog(@"lyrics artwork: on");
