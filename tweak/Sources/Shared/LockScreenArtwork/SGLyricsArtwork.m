@@ -55,6 +55,7 @@ static NSInteger sg_spanFirst = -1, sg_spanCount = 0;   // the clip the lock scr
 static NSInteger sg_started;    // where that clip's first frame sits on the track
 static CFTimeInterval sg_startedAt;   // and when it went up, so a seek can be caught
 static NSInteger sg_lastPosition;
+static CFTimeInterval sg_buildTime;   // how long the last clips took, so a late one can be placed
 static NSMutableDictionary<NSString *, NSDictionary *> *sg_cache;
 static NSMutableSet<NSString *> *sg_pending;   // clips being encoded, so one is never asked for twice
 static BOOL sg_ownArtwork;      // the star has been tapped: show the track's artwork, not the line
@@ -795,6 +796,7 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
             CFTimeInterval took = CACurrentMediaTime() - began;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [sg_pending removeObject:key];
+                if (entry) sg_buildTime = sg_buildTime > 0 ? sg_buildTime * 0.6 + took * 0.4 : took;
                 if (!entry) {
                     note(@"clip %ld could not be made (%.1f s)", (long)first, took);
                     return;
@@ -863,6 +865,7 @@ static void swapMode(void) {
     sg_generation++;
     sg_driftFor = nil;
     sg_ownAt = sg_ownArtwork ? CACurrentMediaTime() : 0;
+    sg_lastPosition = -1;
     SGArtworkReload();
     if (!sg_ownArtwork) tick();
     note(@"%@", sg_ownArtwork ? @"the track's own artwork" : @"back to the line");
@@ -879,6 +882,7 @@ static void tick(void) {
         sg_cache = [NSMutableDictionary dictionary];
         sg_spanFirst = -1;
         sg_spanCount = 0;
+        sg_lastPosition = -1;
     }
     NSArray<SGKaraokeLine *> *lines = SGKaraokeLinesForTrack(track);
     if (!lines) {
@@ -895,20 +899,18 @@ static void tick(void) {
     if (!SGAnimatedArtworkKey(&aspect) || aspect <= 0) return;
     CGSize size = CGSizeMake(round(1920 * aspect), 1920);
 
-    // A seek or a long pause leaves the clip behind the playhead. Caught only while the track is
-    // actually moving, so a pause does not spin the renderer.
-    BOOL playing = position != sg_lastPosition;
+    // A seek is a jump in the playhead between two ticks, not a disagreement with the wall clock:
+    // comparing against the clock kept rebuilding a clip that had simply been drawn a second late,
+    // which left the words permanently behind and the phone drawing all the time.
+    NSInteger step = position - sg_lastPosition;
+    BOOL seeked = sg_lastPosition > 0 && (step < -500 || step > 2500);
     sg_lastPosition = position;
-    if (playing && sg_spanFirst >= 0) {
-        double expect = sg_started + (CACurrentMediaTime() - sg_startedAt) * 1000.0;
-        if (fabs(position - expect) > 2000) {
-            note(@"seek to %ld", (long)position);
-            sg_spanFirst = -1;
-            sg_spanCount = 0;
-            NSString *key = clipKey(track, index, position);
-            if (![sg_pending containsObject:key]) build(lines, index, position, track, size, YES);
-            return;
-        }
+    if (seeked && sg_spanFirst >= 0) {
+        note(@"jumped %ld ms, at %ld", (long)step, (long)position);
+        sg_spanFirst = -1;
+        sg_spanCount = 0;
+        sg_cache = [NSMutableDictionary dictionary];
+        [sg_pending removeAllObjects];
     }
 
     // Still inside the run already on screen: keep it, and have the next one ready before it ends.
@@ -926,8 +928,13 @@ static void tick(void) {
     if (ready) {
         note(@"line %ld of %@ was ready", (long)index, track);
         applyClip(ready, track);
-    } else if (![sg_pending containsObject:key]) {
-        build(lines, index, 0, track, size, YES);
+    } else {
+        // Nothing drawn for this line yet. The clip only starts playing when it is applied, so its
+        // first frame is put where the playhead will be by then, not where it is now: without that
+        // every clip opened a second or two behind and stayed there until the next one.
+        NSInteger lead = (NSInteger)(sg_buildTime * 1000.0) + 250;
+        NSString *late = clipKey(track, index, position + lead);
+        if (![sg_pending containsObject:late]) build(lines, index, position + lead, track, size, YES);
     }
 }
 
