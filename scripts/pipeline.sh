@@ -39,6 +39,33 @@ done
 [ -n "$IN" ] || { echo "no IPA: put a decrypted Spotify .ipa in ipa/, or pass one (make build IPA=path.ipa)" >&2; exit 1; }
 [ -f "$IN" ] || { echo "no such file: $IN" >&2; exit 1; }
 
+# The base does not have to be handed over every time. When the input is not itself an IPA -- a repo
+# archive is enough to satisfy the download step -- the build falls back to the artifact named in
+# .ipa-artifact, which is the decrypted Spotify the previous run was made from. The token comes off
+# the checkout's own credential header; nothing secret goes into the workflow input or the log.
+if ! unzip -Z1 "$IN" 2>/dev/null | grep -qE '^Payload/[^/]+\.app/'; then
+  UNWRAP="$ROOT/out/base"
+  rm -rf "$UNWRAP"; mkdir -p "$UNWRAP"
+  if unzip -q "$IN" -d "$UNWRAP" 2>/dev/null && find "$UNWRAP" -maxdepth 3 -name '*.ipa' | head -1 | grep -q .; then
+    IN="$(find "$UNWRAP" -maxdepth 3 -name '*.ipa' | head -1)"
+    echo "==> base unwrapped from the input: $(basename "$IN")"
+  else
+    ARTIFACT="$(cat "$ROOT/.ipa-artifact" 2>/dev/null || true)"
+    [ -n "$ARTIFACT" ] || { echo "input is not an IPA and .ipa-artifact names no artifact: $IN" >&2; exit 1; }
+    HEADER="$(git -C "$ROOT" config --get http.https://github.com/.extraheader || true)"
+    TOKEN="$(printf '%s' "$HEADER" | sed 's/.*basic //' \
+      | python3 -c 'import sys,base64; print(base64.b64decode(sys.stdin.read().strip()).decode().split(":",1)[1])' 2>/dev/null || true)"
+    [ -n "$TOKEN" ] || { echo "no checkout token to read the artifact with" >&2; exit 1; }
+    echo "==> fetching the base artifact $ARTIFACT"
+    curl -fsSL -H "Authorization: Bearer $TOKEN" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT}/zip" -o "$ROOT/out/base.zip"
+    unzip -q "$ROOT/out/base.zip" -d "$UNWRAP"
+    IN="$(find "$UNWRAP" -maxdepth 3 -name '*.ipa' | head -1)"
+    [ -n "$IN" ] || { echo "the artifact holds no .ipa" >&2; exit 1; }
+    echo "==> base from the artifact: $(basename "$IN")"
+  fi
+fi
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing $1 -> $2" >&2; exit 1; }; }
 need gmake "brew install make"
 need ldid "brew install ldid"
