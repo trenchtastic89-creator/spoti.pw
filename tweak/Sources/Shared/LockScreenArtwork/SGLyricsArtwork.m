@@ -59,6 +59,8 @@ static NSInteger sg_started;    // where that clip's first frame sits on the tra
 static CFTimeInterval sg_startedAt;   // and when it went up, so a seek can be caught
 static NSInteger sg_lastPosition;
 static CFTimeInterval sg_buildTime;   // how long the last clips took, so a late one can be placed
+static NSInteger sg_drawingLine = -1;  // the line a "needed" clip is already being drawn for
+static CFTimeInterval sg_drawingSince;
 static NSMutableDictionary<NSString *, NSDictionary *> *sg_cache;
 static NSMutableSet<NSString *> *sg_pending;   // clips being encoded, so one is never asked for twice
 static BOOL sg_ownArtwork;      // the star has been tapped: show the track's artwork, not the line
@@ -825,6 +827,14 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
         return;
     }
     NSString *key = clipKey(track, first, fromMs);
+    // The clip the playhead is waiting for is asked for again on every tick, each with a slightly
+    // later start time, and the keys differ so the pending check never caught it: a seek left four
+    // full stanzas being encoded one after the other, all but one thrown away.
+    if (show) {
+        if (sg_drawingLine == first && CACurrentMediaTime() - sg_drawingSince < 12) return;
+        sg_drawingLine = first;
+        sg_drawingSince = CACurrentMediaTime();
+    }
     [sg_pending addObject:key];
     CFTimeInterval began = CACurrentMediaTime();
     note(@"drawing %ld from %ld (%@)", (long)first, (long)fromMs, show ? @"needed" : @"ahead");
@@ -834,6 +844,7 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
             CFTimeInterval took = CACurrentMediaTime() - began;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [sg_pending removeObject:key];
+                if (sg_drawingLine == first) sg_drawingLine = -1;
                 if (entry) sg_buildTime = sg_buildTime > 0 ? sg_buildTime * 0.6 + took * 0.4 : took;
                 if (!entry) {
                     note(@"clip %ld could not be made (%.1f s)", (long)first, took);
@@ -922,6 +933,7 @@ static void tick(void) {
         sg_spanFirst = -1;
         sg_spanCount = 0;
         sg_lastPosition = -1;
+        sg_drawingLine = -1;
     }
     NSArray<SGKaraokeLine *> *lines = SGKaraokeLinesForTrack(track);
     if (!lines) {
