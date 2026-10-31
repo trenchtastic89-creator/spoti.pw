@@ -50,7 +50,8 @@ static const NSTimeInterval kShortest = 1.5;
 static const NSTimeInterval kLongest = 12;
 
 static dispatch_queue_t sg_queue;
-static NSString *sg_track;      // the track the cache belongs tostatic NSInteger sg_spanFirst = -1, sg_spanCount = 0;   // the clip the lock screen is showing
+static NSString *sg_track;      // the track the cache belongs to
+static NSInteger sg_spanFirst = -1, sg_spanCount = 0;   // the clip the lock screen is showing
 static NSInteger sg_started;    // where that clip's first frame sits on the track
 static CFTimeInterval sg_startedAt;   // and when it went up, so a seek can be caught
 static NSInteger sg_lastPosition;
