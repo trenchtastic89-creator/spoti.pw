@@ -56,36 +56,46 @@ static UIImage *coverImage(CGSize size) {
     return image;
 }
 
-// The cover at a sixty-fourth of the size it is drawn at, warmed up. Scaled back up it is colour with
-// no detail left in it, which is what keeps the words readable over any sleeve.
+// The cover filled to the frame, blurred hard and warmed up. A real gaussian rather than a small copy
+// scaled back up: the copy left square blocks where the sleeve had detail, and the lock screen is
+// looked at closely enough to see them.
 static UIImage *washImage(UIImage *cover, CGSize size) {
     if (!cover || cover.size.width < 1 || cover.size.height < 1) return nil;
-    CGSize small = CGSizeMake(MAX(12, round(size.width / 64)), MAX(12, round(size.height / 64)));
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
     format.scale = 1;
     format.opaque = YES;
-    UIImage *tiny = [[[UIGraphicsImageRenderer alloc] initWithSize:small format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        CGFloat scale = MAX(small.width / cover.size.width, small.height / cover.size.height);
-        CGSize filled = CGSizeMake(cover.size.width * scale, cover.size.height * scale);
-        [cover drawInRect:CGRectMake((small.width - filled.width) / 2, (small.height - filled.height) / 2,
-                                     filled.width, filled.height)];
+    UIImage *filled = [[[UIGraphicsImageRenderer alloc] initWithSize:size format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        CGFloat scale = MAX(size.width / cover.size.width, size.height / cover.size.height);
+        CGSize drawn = CGSizeMake(cover.size.width * scale, cover.size.height * scale);
+        [cover drawInRect:CGRectMake((size.width - drawn.width) / 2, (size.height - drawn.height) / 2,
+                                     drawn.width, drawn.height)];
     }];
 
     static CIContext *context;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ context = [CIContext contextWithOptions:nil]; });
-    CIImage *input = [CIImage imageWithCGImage:tiny.CGImage];
+    CIImage *input = [CIImage imageWithCGImage:filled.CGImage];
+
+    CIFilter *clamp = [CIFilter filterWithName:@"CIAffineClamp"];
+    [clamp setValue:input forKey:kCIInputImageKey];
+    [clamp setValue:[NSValue valueWithCGAffineTransform:CGAffineTransformIdentity] forKey:kCIInputTransformKey];
+
+    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+    [blur setValue:clamp.outputImage forKey:kCIInputImageKey];
+    [blur setValue:@(size.width * 0.055) forKey:kCIInputRadiusKey];
+
     CIFilter *controls = [CIFilter filterWithName:@"CIColorControls"];
-    [controls setValue:input forKey:kCIInputImageKey];
-    [controls setValue:@1.65 forKey:kCIInputSaturationKey];
-    [controls setValue:@0.03 forKey:kCIInputBrightnessKey];
-    CIImage *boosted = controls.outputImage;
-    if (!boosted) return tiny;
-    CGImageRef out = [context createCGImage:boosted fromRect:input.extent];
-    if (!out) return tiny;
-    UIImage *image = [UIImage imageWithCGImage:out];
-    CGImageRelease(out);
-    return image ?: tiny;
+    [controls setValue:blur.outputImage forKey:kCIInputImageKey];
+    [controls setValue:@1.55 forKey:kCIInputSaturationKey];
+    [controls setValue:@0.02 forKey:kCIInputBrightnessKey];
+
+    CIImage *out = controls.outputImage;
+    if (!out) return filled;
+    CGImageRef image = [context createCGImage:out fromRect:input.extent];
+    if (!image) return filled;
+    UIImage *result = [UIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    return result ?: filled;
 }
 
 static CGImageRef renderFrame(NSString *line, NSArray<NSString *> *following, CGSize size) {
@@ -124,25 +134,23 @@ static CGImageRef renderFrame(NSString *line, NSArray<NSString *> *following, CG
         }
         CGColorSpaceRelease(space);
 
-        CGFloat side = size.width * 0.11;
+        // The redesign's own lyrics view sets every line at one size (SGRKaraokeView: 30pt on a 390pt
+        // page, 24pt margins, 24pt between lines) and lights the sung line only: the rest sit at 30%
+        // white. Copying those numbers is what makes this read as the same feature rather than a
+        // caption, so none of them are invented here.
+        CGFloat side = size.width * (24.0 / 390.0);
         CGFloat width = size.width - side * 2;
-        UIFont *lead = [UIFont systemFontOfSize:size.width * 0.060 weight:UIFontWeightBold];
-        UIFont *under = [UIFont systemFontOfSize:size.width * 0.040 weight:UIFontWeightSemibold];
-
-        NSShadow *shadow = [NSShadow new];
-        shadow.shadowColor = [UIColor colorWithWhite:0 alpha:0.50];
-        shadow.shadowBlurRadius = size.width * 0.014;
-        shadow.shadowOffset = CGSizeMake(0, size.width * 0.004);
+        UIFont *font = [UIFont systemFontOfSize:size.width * (30.0 / 390.0) weight:UIFontWeightBold];
 
         NSMutableArray<NSString *> *texts = [NSMutableArray arrayWithObject:line ?: @""];
-        NSMutableArray<UIFont *> *fonts = [NSMutableArray arrayWithObject:lead];
+        NSMutableArray<UIFont *> *fonts = [NSMutableArray arrayWithObject:font];
         NSMutableArray<UIColor *> *colours = [NSMutableArray arrayWithObject:UIColor.whiteColor];
-        NSMutableArray<NSNumber *> *gaps = [NSMutableArray arrayWithObject:@(size.height * 0.026)];
+        NSMutableArray<NSNumber *> *gaps = [NSMutableArray arrayWithObject:@(size.height * (24.0 / 844.0))];
         for (NSString *next in following) {
             [texts addObject:next];
-            [fonts addObject:under];
-            [colours addObject:[UIColor colorWithWhite:1 alpha:0.46]];
-            [gaps addObject:@(size.height * 0.011)];
+            [fonts addObject:font];
+            [colours addObject:[UIColor colorWithWhite:1 alpha:0.3]];
+            [gaps addObject:@(size.height * (24.0 / 844.0))];
         }
 
         CGFloat total = 0;
@@ -167,7 +175,6 @@ static CGImageRef renderFrame(NSString *line, NSArray<NSString *> *following, CG
                 NSFontAttributeName: fonts[at],
                 NSForegroundColorAttributeName: colours[at],
                 NSParagraphStyleAttributeName: paragraph,
-                NSShadowAttributeName: shadow,
             }];
             y += height + gaps[at].doubleValue;
         }
