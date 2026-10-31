@@ -40,11 +40,14 @@ static const CGFloat kAnchor = 0.36;
 static const CGFloat kPad = 16;
 
 // A clip covers a run of lines, so the system is asked for new artwork once a stanza rather than
-// once a line. Longer runs mean fewer blinks and a longer wait before the first one can be shown.
-static const NSInteger kSpanLines = 4;
-static const NSTimeInterval kFPS = 12;
+// once a line. Longer runs mean fewer blinks and a longer wait before the first one can be shown,
+// but every frame is drawn at the screen's full height and the phone has to keep decoding audio
+// while it does: a stanza that costs a whole second of solid CPU is what made the sound crackle
+// when the screen was locked mid-render, so the run is kept short.
+static const NSInteger kSpanLines = 3;
+static const NSTimeInterval kFPS = 10;
 static const NSTimeInterval kShortest = 1.5;
-static const NSTimeInterval kLongest = 20;
+static const NSTimeInterval kLongest = 12;
 
 static dispatch_queue_t sg_queue;
 static NSString *sg_track;      // the track the cache belongs to
@@ -449,6 +452,9 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
             CVPixelBufferUnlockBaseAddress(buffer, 0);
             if (![adaptor appendPixelBuffer:buffer withPresentationTime:CMTimeMakeWithSeconds(t, 600)]) ok = NO;
             CVPixelBufferRelease(buffer);
+            // Left as it is, this runs flat out on the render queue and starves the audio thread;
+            // a couple of milliseconds between frames costs a fraction of a second over the clip.
+            usleep(2000);
         }
     }
 
@@ -539,6 +545,20 @@ static NSInteger spanCount(NSArray<SGKaraokeLine *> *lines, NSInteger first) {
     return MAX(count, 1);
 }
 
+// The first frame, small: the preview the system shows before the video starts, and the one thing
+// kept in memory for a whole track.
+static UIImage *smaller(UIImage *image, CGFloat width) {
+    if (!image || image.size.width <= width) return image;
+    CGFloat ratio = width / image.size.width;
+    CGSize size = CGSizeMake(round(image.size.width * ratio), round(image.size.height * ratio));
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = 1;
+    format.opaque = YES;
+    return [[[UIGraphicsImageRenderer alloc] initWithSize:size format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        [image drawInRect:CGRectMake(0, 0, size.width, size.height)];
+    }];
+}
+
 // The clip for one run of lines, drawn and encoded, or nil. Cached by track and first line: the same
 // run always looks the same, so it is only ever made once. `fromMs` is where the clip's first frame
 // sits on the track — the line's own start normally, or wherever the playhead was when a seek left
@@ -594,7 +614,8 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
         CGFloat height = heights[i].doubleValue;
         UIImage *sharp = lineImage(layouts[i], texts[i], drawn, pageWidth, height, scale, kPad);
         if (!sharp) continue;
-        still[@(i)] = @[sharp, blurred(sharp, kBlurPerLine * scale), blurred(sharp, MIN(kMaxBlur, kBlurPerLine * 2) * scale)];
+        still[@(i)] = @[blurred(sharp, kBlurPerLine * scale),
+                        blurred(sharp, MIN(kMaxBlur, kBlurPerLine * 2) * scale)];
     }
 
     CGImageRef mask = featherMask();
@@ -628,7 +649,7 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
                 NSArray<UIImage *> *variants = still[@(i)];
                 if (!variants) continue;
                 NSInteger distance = labs((long)(i - at));
-                UIImage *image = distance <= 1 ? variants[1] : variants[2];
+                UIImage *image = distance <= 1 ? variants[0] : variants[1];
                 CGFloat y = (kAnchor * kPageHeight + tops[i].doubleValue - scroll - kPad) * scale;
                 [image drawInRect:CGRectMake(0, y, pageWidth * scale, image.size.height) blendMode:kCGBlendModeNormal alpha:kDimAlpha];
             }
@@ -670,7 +691,7 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
                 if (i == at) continue;
                 NSArray<UIImage *> *variants = still[@(i)];
                 if (!variants) continue;
-                UIImage *image = labs((long)(i - at)) <= 1 ? variants[1] : variants[2];
+                UIImage *image = labs((long)(i - at)) <= 1 ? variants[0] : variants[1];
                 CGFloat y = (kAnchor * kPageHeight + tops[i].doubleValue - scroll - kPad) * scale;
                 [image drawInRect:CGRectMake(0, y, pageWidth * scale, image.size.height) blendMode:kCGBlendModeNormal alpha:kDimAlpha];
             }
@@ -683,6 +704,9 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
         }];
     }
     if (!poster) return nil;
+    // Kept in memory for the rest of the track, so it is stored small: a full-height frame here is
+    // 7 MB a stanza and the lock screen re-renders it into whatever size it asks for anyway.
+    poster = smaller(poster, 480);
     return @{@"file": file, @"still": poster, @"first": @(first), @"count": @(count), @"from": @(startMs)};
 }
 
@@ -705,6 +729,11 @@ static NSString *clipKey(NSString *track, NSInteger first, NSInteger fromMs) {
 
 static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fromMs,
                   NSString *track, CGSize size, BOOL show) {
+    // A phone that is already hot has no room for a hundred full-height frames on top of the audio.
+    if (NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious) {
+        SGLog(@"lyrics artwork: too warm to draw another clip");
+        return;
+    }
     NSString *key = clipKey(track, first, fromMs);
     [sg_pending addObject:key];
     dispatch_async(sg_queue, ^{
@@ -715,6 +744,12 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
                 if (!entry) return;
                 if (![track isEqualToString:sg_track ?: @""]) return;
                 if (fromMs <= 0) sg_cache[key] = entry;
+                // Only the clips either side of the playhead are ever wanted again.
+                if (sg_cache.count > 6) {
+                    for (NSString *old in sg_cache.allKeys) {
+                        if (![old isEqualToString:key]) { [sg_cache removeObjectForKey:old]; break; }
+                    }
+                }
                 if (show && sg_spanFirst != first) {
                     SGLog(@"lyrics artwork: from line %ld of %@", (long)first, track);
                     applyClip(entry, track);
@@ -845,7 +880,8 @@ __attribute__((constructor)) static void SGLyricsArtworkStart(void) {
 
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        sg_queue = dispatch_queue_create("com.spotipw.lyricsartwork", DISPATCH_QUEUE_SERIAL);
+        sg_queue = dispatch_queue_create("com.spotipw.lyricsartwork",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
         sg_pending = [NSMutableSet set];
         dispatch_async(dispatch_get_main_queue(), ^{
             // The star on the lock screen is the like command; first in, so a tap lands here before
