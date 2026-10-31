@@ -210,13 +210,15 @@ void SGSettingsBackupForget(void) {
 
 #pragma mark - when it runs
 
-// A constructor, not +load. The rest of the mod starts the same way, and +load runs while the images
-// are still being loaded: UIKit's notification name constants are not necessarily filled in yet, and
-// an observer registered with a null name is an exception on the launch screen. By the time this runs
-// every framework the app will use is up, and it is still before any page reads a switch.
+// A constructor, not +load: +load runs while the images are still being loaded, and anything that
+// waits on another process there — the keychain, a preferences daemon — can deadlock against a main
+// thread that has not started its run loop yet. Nothing in here is allowed to block.
 __attribute__((constructor)) static void SGSettingsBackupStart(void) {
     @autoreleasepool {
-        restore_if_needed();
+        // The restore waits for the app to finish putting itself together. Two seconds in, the run
+        // loop is up and the settings pages are still a tap away.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ restore_if_needed(); });
 
         // Whatever is saved is saved again the moment it changes: the settings pages all write through
         // NSUserDefaults, so one notification covers every switch, list and flag override there is.
