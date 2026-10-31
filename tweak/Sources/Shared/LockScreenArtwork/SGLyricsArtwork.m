@@ -781,9 +781,11 @@ static NSString *clipKey(NSString *track, NSInteger first, NSInteger fromMs) {
 
 static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fromMs,
                   NSString *track, CGSize size, BOOL show) {
-    // A phone that is already hot has no room for a hundred full-height frames on top of the audio.
-    if (NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious) {
-        note(@"too warm to draw another clip");
+    // A phone that is already hot, or a queue that is already full, gets no prefetch. The clip the
+    // playhead is actually waiting for is always drawn: leaving it blank is worse than the heat.
+    if (!show && (NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious ||
+                  sg_pending.count > 0)) {
+        note(@"holding the next clip back");
         return;
     }
     NSString *key = clipKey(track, first, fromMs);
