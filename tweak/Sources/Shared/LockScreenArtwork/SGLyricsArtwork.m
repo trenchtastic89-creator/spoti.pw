@@ -146,8 +146,8 @@ static BOOL writeClip(CGImageRef image, NSTimeInterval seconds, NSURL *url) {
     // file still ends on a sample with a duration of its own.
     CMTime end = CMTimeMakeWithSeconds(seconds, 600);
     CMTime tail = CMTimeMakeWithSeconds(MAX(seconds - 0.05, 0.05), 600);
-    BOOL first = [adaptor appendPixelBuffer:buffer atPresentationTime:kCMTimeZero];
-    BOOL last = [adaptor appendPixelBuffer:buffer atPresentationTime:tail];
+    BOOL first = [adaptor appendPixelBuffer:buffer withPresentationTime:kCMTimeZero];
+    BOOL last = [adaptor appendPixelBuffer:buffer withPresentationTime:tail];
     CFRelease(buffer);
     [input markAsFinished];
     [writer endSessionAtSourceTime:end];
