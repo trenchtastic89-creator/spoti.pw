@@ -5,7 +5,9 @@
 // is written under a new artwork id and the now playing dictionary is sent again, which is what
 // makes the system ask for it.
 //
-// Nothing here runs unless Animated lock screen is on and the track has timed lyrics.
+// The frame is Apple Music's: the artwork softened to a wash of its own colour, dimmed hard, and the
+// line centred in the upper half with the ones after it under it. Nothing of the photo survives but
+// the colour, which is what keeps white text readable over any cover.
 #import <MediaPlayer/MediaPlayer.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
@@ -18,6 +20,8 @@ static const NSTimeInterval kTick = 0.3;
 static const NSTimeInterval kShortest = 1.2;
 // Past this a clip is cut short; the system loops it and a still has nowhere to go.
 static const NSTimeInterval kLongest = 10.0;
+// How many lines after the one being sung are drawn under it.
+static const NSUInteger kFollowing = 2;
 
 static dispatch_queue_t sg_queue;
 static NSString *sg_want;   // track|line the last clip was asked for
@@ -40,47 +44,92 @@ static UIImage *coverImage(CGSize size) {
     return image;
 }
 
-static void drawText(NSString *text, CGRect rect, UIFont *font, UIColor *colour) {
-    if (!text.length) return;
-    NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
-    paragraph.alignment = NSTextAlignmentCenter;
-    paragraph.lineBreakMode = NSLineBreakByWordWrapping;
-    [text drawInRect:rect withAttributes:@{
-        NSFontAttributeName: font,
-        NSForegroundColorAttributeName: colour,
-        NSParagraphStyleAttributeName: paragraph,
-    }];
-}
-
-// The cover filled to the size, darkened, the line large and the next one dim under it.
-static CGImageRef renderFrame(NSString *line, NSString *next, CGSize size) {
-    UIImage *cover = coverImage(size);
+// The cover at a twenty-sixth of the size it is drawn at. Scaled back up, it carries the colours and
+// none of the detail, which is the whole look: a still of the album rather than a photograph.
+static UIImage *washImage(UIImage *cover, CGSize size) {
+    if (!cover || cover.size.width < 1 || cover.size.height < 1) return nil;
+    CGSize small = CGSizeMake(MAX(16, round(size.width / 26)), MAX(16, round(size.height / 26)));
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
     format.scale = 1;
     format.opaque = YES;
+    return [[[UIGraphicsImageRenderer alloc] initWithSize:small format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        CGFloat scale = MAX(small.width / cover.size.width, small.height / cover.size.height);
+        CGSize filled = CGSizeMake(cover.size.width * scale, cover.size.height * scale);
+        [cover drawInRect:CGRectMake((small.width - filled.width) / 2, (small.height - filled.height) / 2,
+                                     filled.width, filled.height)];
+    }];
+}
+
+static CGImageRef renderFrame(NSString *line, NSArray<NSString *> *following, CGSize size) {
+    UIImage *cover = coverImage(size);
+    UIImage *wash = washImage(cover, size);
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = 1;
+    format.opaque = YES;
+
     UIImage *drawn = [[[UIGraphicsImageRenderer alloc] initWithSize:size format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
         CGContextRef c = context.CGContext;
         [[UIColor blackColor] setFill];
         CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
-        if (cover.size.width > 0 && cover.size.height > 0) {
-            CGFloat scale = MAX(size.width / cover.size.width, size.height / cover.size.height);
-            CGSize filled = CGSizeMake(cover.size.width * scale, cover.size.height * scale);
-            [cover drawInRect:CGRectMake((size.width - filled.width) / 2, (size.height - filled.height) / 2,
-                                         filled.width, filled.height)];
-        }
-        [[UIColor colorWithWhite:0 alpha:0.45] setFill];
-        CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
-        CGFloat band = size.height * 0.42;
-        [[UIColor colorWithWhite:0 alpha:0.35] setFill];
-        CGContextFillRect(c, CGRectMake(0, size.height - band, size.width, band));
+        if (wash) [wash drawInRect:CGRectMake(0, 0, size.width, size.height)];
 
-        CGFloat side = size.width * 0.08;
+        // Dark enough that white reads at any screen brightness, and darker toward the bottom where
+        // the controls sit, so the two never fight.
+        [[UIColor colorWithWhite:0 alpha:0.55] setFill];
+        CGContextFillRect(c, CGRectMake(0, 0, size.width, size.height));
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        NSArray *stops = @[(id)[UIColor colorWithWhite:0 alpha:0.30].CGColor,
+                           (id)[UIColor colorWithWhite:0 alpha:0.75].CGColor];
+        CGGradientRef gradient = CGGradientCreateWithColors(space, (__bridge CFArrayRef)stops, NULL);
+        if (gradient) {
+            CGContextDrawLinearGradient(c, gradient, CGPointMake(0, 0), CGPointMake(0, size.height), 0);
+            CGGradientRelease(gradient);
+        }
+        CGColorSpaceRelease(space);
+
+        CGFloat side = size.width * 0.10;
         CGFloat width = size.width - side * 2;
-        UIFont *lead = [UIFont systemFontOfSize:size.width * 0.082 weight:UIFontWeightBold];
-        UIFont *under = [UIFont systemFontOfSize:size.width * 0.052 weight:UIFontWeightSemibold];
-        drawText(line, CGRectMake(side, size.height * 0.60, width, size.height * 0.17), lead, UIColor.whiteColor);
-        drawText(next, CGRectMake(side, size.height * 0.79, width, size.height * 0.10), under,
-                 [UIColor colorWithWhite:1 alpha:0.55]);
+        UIFont *lead = [UIFont systemFontOfSize:size.width * 0.058 weight:UIFontWeightBold];
+        UIFont *under = [UIFont systemFontOfSize:size.width * 0.042 weight:UIFontWeightSemibold];
+
+        NSMutableArray<NSString *> *texts = [NSMutableArray arrayWithObject:line ?: @""];
+        NSMutableArray<UIFont *> *fonts = [NSMutableArray arrayWithObject:lead];
+        NSMutableArray<UIColor *> *colours = [NSMutableArray arrayWithObject:UIColor.whiteColor];
+        NSMutableArray<NSNumber *> *gaps = [NSMutableArray arrayWithObject:@(size.height * 0.022)];
+        for (NSString *next in following) {
+            [texts addObject:next];
+            [fonts addObject:under];
+            [colours addObject:[UIColor colorWithWhite:1 alpha:0.48]];
+            [gaps addObject:@(size.height * 0.010)];
+        }
+
+        // Measured first, so the block hangs from its own centre rather than off the top.
+        CGFloat total = 0;
+        NSMutableArray<NSNumber *> *heights = [NSMutableArray array];
+        for (NSUInteger at = 0; at < texts.count; at++) {
+            CGRect box = [texts[at] boundingRectWithSize:CGSizeMake(width, size.height)
+                                                 options:NSStringDrawingUsesLineFragmentOrigin
+                                              attributes:@{NSFontAttributeName: fonts[at]}
+                                                 context:nil];
+            CGFloat height = ceil(box.size.height);
+            [heights addObject:@(height)];
+            total += height + gaps[at].doubleValue;
+        }
+
+        CGFloat y = size.height * 0.38 - total / 2;
+        for (NSUInteger at = 0; at < texts.count; at++) {
+            NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
+            paragraph.alignment = NSTextAlignmentCenter;
+            paragraph.lineBreakMode = NSLineBreakByWordWrapping;
+            CGFloat height = heights[at].doubleValue;
+            [texts[at] drawInRect:CGRectMake(side, y, width, height + 2) withAttributes:@{
+                NSFontAttributeName: fonts[at],
+                NSForegroundColorAttributeName: colours[at],
+                NSParagraphStyleAttributeName: paragraph,
+            }];
+            y += height + gaps[at].doubleValue;
+        }
     }];
     return CGImageRetain(drawn.CGImage);
 }
@@ -168,7 +217,12 @@ static BOOL writeClip(CGImageRef image, NSTimeInterval seconds, NSURL *url) {
 
 static void render(NSArray<SGKaraokeLine *> *lines, NSInteger index, NSString *track) {
     NSString *line = SGKaraokeLineText(lines[index]);
-    NSString *next = index + 1 < (NSInteger)lines.count ? SGKaraokeLineText(lines[index + 1]) : nil;
+    NSMutableArray<NSString *> *following = [NSMutableArray array];
+    for (NSInteger at = index + 1; at < (NSInteger)lines.count && following.count < kFollowing; at++) {
+        NSString *text = SGKaraokeLineText(lines[at]);
+        if (text.length) [following addObject:text];
+    }
+
     NSInteger span = SGKaraokeSungEnd(lines[index]) - lines[index].start;
     if (span <= 0) span = 4000;
     NSTimeInterval seconds = MIN(MAX(span / 1000.0, kShortest), kLongest);
@@ -183,7 +237,7 @@ static void render(NSArray<SGKaraokeLine *> *lines, NSInteger index, NSString *t
 
     dispatch_async(sg_queue, ^{
         @autoreleasepool {
-            CGImageRef image = renderFrame(line, next, size);
+            CGImageRef image = renderFrame(line, following, size);
             if (!image) return;
             BOOL wrote = writeClip(image, seconds, file);
             UIImage *still = wrote ? [UIImage imageWithCGImage:image] : nil;
