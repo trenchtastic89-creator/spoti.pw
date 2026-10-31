@@ -473,6 +473,14 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
 
+    // The frame is rendered to an image and then copied in. Drawing straight into the pixel buffer
+    // would be one allocation cheaper, but it needs the context turned over first, and every build
+    // that tried it put a black video on the lock screen instead of a lyric. The copy stays.
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = 1;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(w, h) format:format];
+
     NSInteger frames = MAX(1, (NSInteger)llround(seconds * fps));
     BOOL ok = YES;
     // AVFoundation throws, rather than returns an error, when the encoder is fed while it is full —
@@ -490,6 +498,9 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
                 if (!input.readyForMoreMediaData) { ok = NO; break; }
 
                 NSTimeInterval t = frame / fps;
+                UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+                    draw(context.CGContext, t);
+                }];
                 CVPixelBufferRef buffer = NULL;
                 if (adaptor.pixelBufferPool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, adaptor.pixelBufferPool, &buffer);
                 if (!buffer) {
@@ -501,13 +512,9 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
                 CGContextRef c = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buffer), w, h, 8,
                     CVPixelBufferGetBytesPerRow(buffer), space, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
                 if (c) {
-                    // The block lays out the way UIKit does, from the top down. A bitmap context's own
-                    // space runs bottom up, so it is turned over here rather than over the finished
-                    // picture: the frame goes straight into the buffer instead of through an image
-                    // the size of the screen that exists for one blit.
-                    CGContextTranslateCTM(c, 0, h);
-                    CGContextScaleCTM(c, 1, -1);
-                    draw(c, t);
+                    // Drawn straight in: a bitmap context already puts the image the right way up, and
+                    // turning it over here is what had the whole clip upside down on the lock screen.
+                    CGContextDrawImage(c, CGRectMake(0, 0, w, h), image.CGImage);
                     CGContextRelease(c);
                 } else {
                     ok = NO;
@@ -832,8 +839,9 @@ static void build(NSArray<SGKaraokeLine *> *lines, NSInteger first, NSInteger fr
                     note(@"clip %ld could not be made (%.1f s)", (long)first, took);
                     return;
                 }
-                note(@"clip %ld ready in %.1f s for %@ s", (long)first, took,
-                     [entry[@"seconds"] stringValue] ?: @"?");
+                note(@"clip %ld ready in %.1f s for %@ s, %lld bytes", (long)first, took,
+                     [entry[@"seconds"] stringValue] ?: @"?",
+                     [NSFileManager.defaultManager attributesOfItemAtPath:[entry[@"file"] path] error:nil].fileSize);
                 if (![track isEqualToString:sg_track ?: @""]) return;
                 if (fromMs <= 0) sg_cache[key] = entry;
                 // Only the clips either side of the playhead are ever wanted again.
