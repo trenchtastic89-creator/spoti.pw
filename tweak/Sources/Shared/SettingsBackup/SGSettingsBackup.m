@@ -21,17 +21,48 @@ static BOOL backed_up_key(NSString *key) {
     return [key hasPrefix:@"spotifyglass."] || [key hasPrefix:@"spotipw."];
 }
 
+// JSON has no dates and no blobs, and the settings only ever hold strings, numbers and the odd array.
+// Anything else is dropped rather than thrown over: a single unencodable default would otherwise take
+// the whole save, and the app with it.
+static id json_safe(id value) {
+    if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class]) return value;
+    if ([value isKindOfClass:NSArray.class]) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id item in value) {
+            id safe = json_safe(item);
+            if (safe) [out addObject:safe];
+        }
+        return out;
+    }
+    if ([value isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        [value enumerateKeysAndObjectsUsingBlock:^(id key, id item, BOOL *stop) {
+            if (![key isKindOfClass:NSString.class]) return;
+            id safe = json_safe(item);
+            if (safe) out[key] = safe;
+        }];
+        return out;
+    }
+    return nil;
+}
+
 static NSDictionary *snapshot(void) {
     NSUserDefaults *store = NSUserDefaults.standardUserDefaults;
-    NSDictionary *domain = [store persistentDomainForName:NSBundle.mainBundle.bundleIdentifier] ?: @{};
+    NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
+    if (!bundle.length) return nil;
+    NSDictionary *domain = [store persistentDomainForName:bundle];
+    if (![domain isKindOfClass:NSDictionary.class]) return nil;
     NSMutableDictionary *values = [NSMutableDictionary dictionaryWithCapacity:domain.count];
     for (NSString *key in domain) {
-        if (backed_up_key(key)) values[key] = domain[key];
+        if (!backed_up_key(key)) continue;
+        id safe = json_safe(domain[key]);
+        if (safe) values[key] = safe;
     }
     return values;
 }
 
 static NSData *encoded(NSDictionary *values) {
+    if (![NSJSONSerialization isValidJSONObject:values]) return nil;
     return [NSJSONSerialization dataWithJSONObject:values options:NSJSONWritingSortedKeys error:NULL];
 }
 
@@ -41,8 +72,8 @@ static NSDictionary *decoded(NSData *data) {
     return [value isKindOfClass:NSDictionary.class] ? value : nil;
 }
 
-static CFDictionaryRef item_query(void) {
-    return (__bridge CFDictionaryRef)@{
+static NSDictionary *item_query(void) {
+    return @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: kBackupService,
         (__bridge id)kSecAttrAccount: kBackupAccount,
@@ -50,7 +81,7 @@ static CFDictionaryRef item_query(void) {
 }
 
 static NSData *read_backup(OSStatus *outStatus) {
-    NSMutableDictionary *query = [(__bridge NSDictionary *)item_query() mutableCopy];
+    NSMutableDictionary *query = [item_query() mutableCopy];
     query[(__bridge id)kSecReturnData] = @YES;
     query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
     CFTypeRef result = NULL;
@@ -61,8 +92,8 @@ static NSData *read_backup(OSStatus *outStatus) {
 }
 
 static BOOL write_backup(NSData *data) {
-    SecItemDelete(item_query());
-    NSMutableDictionary *item = [(__bridge NSDictionary *)item_query() mutableCopy];
+    SecItemDelete((__bridge CFDictionaryRef)item_query());
+    NSMutableDictionary *item = [item_query() mutableCopy];
     item[(__bridge id)kSecValueData] = data;
     item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
     OSStatus status = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
@@ -88,60 +119,77 @@ static NSUInteger restore_into(NSUserDefaults *store, NSDictionary *saved) {
 
 // The first launch after an install: the defaults are empty, the keychain is not.
 static BOOL restore_if_needed(void) {
-    NSUserDefaults *store = NSUserDefaults.standardUserDefaults;
-    if ([store objectForKey:kRestoredKey] != nil) return NO;
-    OSStatus status = errSecSuccess;
-    NSData *blob = read_backup(&status);
-    // Only "there is nothing there" is an answer. Anything else means the keychain could not be
-    // asked yet, and the marker is left unset so the next launch does get to read it.
-    if (!blob && status != errSecItemNotFound && status != errSecSuccess) {
-        SGLog(@"settings backup: keychain not readable at launch (%d), trying again next time", (int)status);
+    @try {
+        NSUserDefaults *store = NSUserDefaults.standardUserDefaults;
+        if ([store objectForKey:kRestoredKey] != nil) return NO;
+        OSStatus status = errSecSuccess;
+        NSData *blob = read_backup(&status);
+        // Only "there is nothing there" is an answer. Anything else means the keychain could not be
+        // asked yet, and the marker is left unset so the next launch does get to read it.
+        if (!blob && status != errSecItemNotFound && status != errSecSuccess) {
+            SGLog(@"settings backup: keychain not readable at launch (%d), trying again next time", (int)status);
+            return NO;
+        }
+        NSDictionary *saved = decoded(blob);
+        NSUInteger applied = saved ? restore_into(store, saved) : 0;
+        [store setBool:YES forKey:kRestoredKey];
+        [store synchronize];
+        SGLog(@"settings backup: %@", saved ? [NSString stringWithFormat:@"put back %lu settings", (unsigned long)applied]
+                                            : @"nothing saved on this phone yet");
+        return applied > 0;
+    } @catch (NSException *exception) {
+        // Nothing here is worth a launch: if the defaults or the keychain refuse, the mod simply
+        // starts from the build's own defaults like it would without any of this.
+        SGLog(@"settings backup: restore threw %@", exception.reason);
         return NO;
     }
-    NSDictionary *saved = decoded(blob);
-    NSUInteger applied = saved ? restore_into(store, saved) : 0;
-    [store setBool:YES forKey:kRestoredKey];
-    [store synchronize];
-    SGLog(@"settings backup: %@", saved ? [NSString stringWithFormat:@"put back %lu settings", (unsigned long)applied]
-                                        : @"nothing saved on this phone yet");
-    return applied > 0;
 }
 
 NSString *SGSettingsBackupSummary(void) {
-    NSDictionary *saved = decoded(read_backup(NULL));
-    if (!saved) return @"Nothing saved yet";
-    NSUInteger count = 0;
-    for (NSString *key in saved) if (backed_up_key(key)) count++;
-    NSNumber *at = saved[@"_savedAt"];
-    if (![at isKindOfClass:NSNumber.class] || at.doubleValue <= 0) {
-        return [NSString stringWithFormat:@"%lu settings", (unsigned long)count];
+    @try {
+        NSDictionary *saved = decoded(read_backup(NULL));
+        if (!saved) return @"Nothing saved yet";
+        NSUInteger count = 0;
+        for (NSString *key in saved) if (backed_up_key(key)) count++;
+        NSNumber *at = saved[@"_savedAt"];
+        if (![at isKindOfClass:NSNumber.class] || at.doubleValue <= 0) {
+            return [NSString stringWithFormat:@"%lu settings", (unsigned long)count];
+        }
+        static NSDateFormatter *stamp;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            stamp = [NSDateFormatter new];
+            stamp.dateFormat = @"d MMM, HH:mm";
+        });
+        return [NSString stringWithFormat:@"%lu settings · %@", (unsigned long)count,
+                [stamp stringFromDate:[NSDate dateWithTimeIntervalSince1970:at.doubleValue]]];
+    } @catch (NSException *exception) {
+        return @"Unavailable";
     }
-    static NSDateFormatter *stamp;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        stamp = [NSDateFormatter new];
-        stamp.dateFormat = @"d MMM, HH:mm";
-    });
-    return [NSString stringWithFormat:@"%lu settings · %@", (unsigned long)count,
-            [stamp stringFromDate:[NSDate dateWithTimeIntervalSince1970:at.doubleValue]]];
 }
 
 BOOL SGSettingsBackupSave(void) {
-    NSDictionary *values = snapshot();
-    NSData *plain = encoded(values);
-    if (!plain) return NO;
-    // The timestamp moves on every save, so the comparison is made against the settings alone: a
-    // notification storm from Spotify's own writes then costs one dictionary compare, not a keychain
-    // round trip.
-    static NSData *last;
-    if (last && [last isEqualToData:plain]) return YES;
+    @try {
+        NSDictionary *values = snapshot();
+        if (!values) return NO;
+        NSData *plain = encoded(values);
+        if (!plain) return NO;
+        // The timestamp moves on every save, so the comparison is made against the settings alone: a
+        // notification storm from Spotify's own writes then costs one dictionary compare, not a
+        // keychain round trip.
+        static NSData *last;
+        if (last && [last isEqualToData:plain]) return YES;
 
-    NSMutableDictionary *stamped = [values mutableCopy];
-    stamped[@"_savedAt"] = @(NSDate.date.timeIntervalSince1970);
-    NSData *data = encoded(stamped);
-    if (!data || !write_backup(data)) return NO;
-    last = plain;
-    return YES;
+        NSMutableDictionary *stamped = [values mutableCopy];
+        stamped[@"_savedAt"] = @(NSDate.date.timeIntervalSince1970);
+        NSData *data = encoded(stamped);
+        if (!data || !write_backup(data)) return NO;
+        last = plain;
+        return YES;
+    } @catch (NSException *exception) {
+        SGLog(@"settings backup: save threw %@", exception.reason);
+        return NO;
+    }
 }
 
 void SGSettingsBackupRestore(void) {
@@ -156,41 +204,48 @@ void SGSettingsBackupRestore(void) {
 }
 
 void SGSettingsBackupForget(void) {
-    SecItemDelete(item_query());
+    SecItemDelete((__bridge CFDictionaryRef)item_query());
     SGLog(@"settings backup: forgotten");
 }
 
 #pragma mark - when it runs
 
-// +load, not a constructor: it runs while the dylib is being loaded, before any feature's own
-// constructor, so nothing reads a switch from before the restore.
-@interface SGSettingsBackupWatcher : NSObject
-@end
+// A constructor, not +load. The rest of the mod starts the same way, and +load runs while the images
+// are still being loaded: UIKit's notification name constants are not necessarily filled in yet, and
+// an observer registered with a null name is an exception on the launch screen. By the time this runs
+// every framework the app will use is up, and it is still before any page reads a switch.
+__attribute__((constructor)) static void SGSettingsBackupStart(void) {
+    @autoreleasepool {
+        restore_if_needed();
 
-@implementation SGSettingsBackupWatcher
-+ (void)load {
-    restore_if_needed();
-    // Whatever is saved is saved again the moment it changes: the settings pages all write through
-    // NSUserDefaults, so one notification covers every switch, list and flag override there is.
-    [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification
-                                                    object:nil
-                                                     queue:NSOperationQueue.mainQueue
-                                                usingBlock:^(NSNotification *note) {
-        NSUInteger generation = ++sg_saveGeneration;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSaveDelay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (generation != sg_saveGeneration) return;
-            SGSettingsBackupSave();
-        });
-    }];
-    // The app can be killed while suspended without another run loop turn, so the last few seconds of
-    // switches are flushed on the way out.
-    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                    object:nil
-                                                     queue:NSOperationQueue.mainQueue
-                                                usingBlock:^(NSNotification *note) {
-        sg_saveGeneration++;
-        SGSettingsBackupSave();
-    }];
+        // Whatever is saved is saved again the moment it changes: the settings pages all write through
+        // NSUserDefaults, so one notification covers every switch, list and flag override there is.
+        [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification
+                                                        object:nil
+                                                         queue:nil
+                                                    usingBlock:^(NSNotification *note) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSUInteger generation = ++sg_saveGeneration;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSaveDelay * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (generation != sg_saveGeneration) return;
+                    SGSettingsBackupSave();
+                });
+            });
+        }];
+        // The app can be killed while suspended without another run loop turn, so the last few seconds
+        // of switches are flushed on the way out.
+        NSString *background = UIApplicationDidEnterBackgroundNotification;
+        if (background.length) {
+            [NSNotificationCenter.defaultCenter addObserverForName:background
+                                                            object:nil
+                                                             queue:nil
+                                                        usingBlock:^(NSNotification *note) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    sg_saveGeneration++;
+                    SGSettingsBackupSave();
+                });
+            }];
+        }
+    }
 }
-@end
