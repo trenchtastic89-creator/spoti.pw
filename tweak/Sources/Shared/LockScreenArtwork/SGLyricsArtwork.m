@@ -199,13 +199,13 @@ static NSArray<SGKaraokeWord *> *timedWords(SGKaraokeLine *line) {
 // line end to end, so the feather's travel across a row break is the same arithmetic as within one.
 static NSData *layoutWords(NSArray<SGKaraokeWord *> *words, UIFont *font, CGFloat width, CGFloat *outHeight) {
     NSMutableData *data = [NSMutableData data];
-    CGFloat space = ceil([@" " sizeWithAttributes:@{NSFontAttributeName: font}].size.width);
+    CGFloat space = ceil([@" " sizeWithAttributes:@{NSFontAttributeName: font}].width);
     CGFloat row = ceil(font.lineHeight) - 2;
     CGFloat high = ceil(font.lineHeight);
     CGFloat x = 0, y = 0, flow = 0;
     for (NSUInteger i = 0; i < words.count; i++) {
         SGKaraokeWord *word = words[i];
-        CGFloat w = ceil([word.text sizeWithAttributes:@{NSFontAttributeName: font}].size.width);
+        CGFloat w = ceil([word.text sizeWithAttributes:@{NSFontAttributeName: font}].width);
         if (w < 1) w = 1;
         CGFloat lead = (i == 0 || word.joined) ? 0 : space;
         if (i > 0 && x + lead + w > width) {
