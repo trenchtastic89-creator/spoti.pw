@@ -45,7 +45,10 @@ static const CGFloat kPad = 16;
 // while it does: a stanza that costs a whole second of solid CPU is what made the sound crackle
 // when the screen was locked mid-render, so the run is kept short.
 static const NSInteger kSpanLines = 3;
-static const NSTimeInterval kFPS = 10;
+// The sweep is drawn into the file, so its smoothness is this number: at ten frames a second a word
+// lit in three steps. Fifteen is enough for the feather to read as travel, and still leaves a clip
+// being encoded in a second and a half. The frames themselves are blits, not type.
+static const NSTimeInterval kFPS = 15;
 static const NSTimeInterval kShortest = 1.5;
 static const NSTimeInterval kLongest = 12;
 
@@ -373,17 +376,29 @@ static void drawSungLine(CGContextRef c, UIImage *sharp, NSData *boxes, CGFloat 
     }
     const SGWordBox *b = boxes.bytes;
     NSUInteger n = boxes.length / sizeof(SGWordBox);
+    CGFloat half = kFillEdge / 2;
     for (NSUInteger i = 0; i < n; i++) {
         CGFloat heard = cursor - b[i].flow;
         if (heard <= 0) continue;
-        CGContextSaveGState(c);
-        CGContextClipToRect(c, CGRectMake(b[i].x * scale, offsetY + (kPad + b[i].y) * scale,
-                                          b[i].w * scale, b[i].h * scale));
-        if (heard < b[i].w + kFillEdge / 2) {
-            CGContextClipToMask(c, CGRectMake((b[i].x + heard - kFillEdge / 2) * scale,
-                                              offsetY + (kPad + b[i].y) * scale,
-                                              kFillEdge * scale, b[i].h * scale), feather);
+        CGRect word = CGRectMake(b[i].x * scale, offsetY + (kPad + b[i].y) * scale,
+                                 b[i].w * scale, b[i].h * scale);
+        // Everything the feather has already passed is lit all the way through. Without this the
+        // word behind the playhead stayed dim except for the feather itself, so each word lit as a
+        // strip and then snapped white when the cursor left it.
+        CGFloat solid = MIN(b[i].x + b[i].w, b[i].x + heard - half);
+        if (solid > b[i].x) {
+            CGContextSaveGState(c);
+            CGContextClipToRect(c, CGRectMake(b[i].x * scale, word.origin.y,
+                                              (solid - b[i].x) * scale, word.size.height));
+            [sharp drawInRect:rect blendMode:kCGBlendModeNormal alpha:1.0];
+            CGContextRestoreGState(c);
         }
+        if (heard >= b[i].w + half) continue;
+        CGContextSaveGState(c);
+        CGContextClipToRect(c, word);
+        CGContextClipToMask(c, CGRectMake((b[i].x + heard - half) * scale,
+                                          offsetY + (kPad + b[i].y) * scale,
+                                          kFillEdge * scale, b[i].h * scale), feather);
         [sharp drawInRect:rect blendMode:kCGBlendModeNormal alpha:1.0];
         CGContextRestoreGState(c);
     }
