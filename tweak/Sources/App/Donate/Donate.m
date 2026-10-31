@@ -460,11 +460,9 @@ static __weak SGDonateController *sg_sheet;
 static BOOL sg_offered;
 
 void SGShowDonateSheet(void) {
-    UIViewController *top = SGTopController();
-    if (sg_sheet || !top || [top isKindOfClass:UIAlertController.class]) return;
-    SGDonateController *sheet = [SGDonateController new];
-    sg_sheet = sheet;
-    [top presentViewController:sheet animated:NO completion:nil];
+    // This build is made for one person and asks nobody for anything: no coffee sheet, neither on
+    // a schedule nor after the tour. The row that opened it is gone from Mod Settings as well.
+    (void)sg_sheet;
 }
 
 SGModRow *SGDonateRow(void) {
