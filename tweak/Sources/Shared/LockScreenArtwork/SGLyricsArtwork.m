@@ -286,70 +286,70 @@ static CGImageRef featherMask(void) {
     return mask;
 }
 
-// One line of the page, at the height it is drawn at. `mask` is nil for an ordinary pass; when it is
-// set only the part of each word behind the playhead is drawn, feathered across kFillEdge.
+// One line of the page, written into a context at the frame's scale. Only ever used to make a
+// line's picture: the clip draws those pictures, it never sets type for the same line twice.
 static void drawLineWords(CGContextRef c, NSData *boxes, NSArray<NSString *> *texts, UIFont *font,
-                          CGFloat offsetX, CGFloat offsetY, CGFloat scale, double ms,
-                          CGFloat cursor, CGImageRef mask, CGFloat alpha) {
+                          CGFloat offsetX, CGFloat offsetY, CGFloat scale) {
     const SGWordBox *b = boxes.bytes;
     NSUInteger n = boxes.length / sizeof(SGWordBox);
     NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
     paragraph.lineBreakMode = NSLineBreakByClipping;
+    NSDictionary *attributes = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: UIColor.whiteColor,
+        NSParagraphStyleAttributeName: paragraph,
+    };
     for (NSUInteger i = 0; i < n; i++) {
-        CGFloat lift = liftAt(&b[i], ms);
-        CGRect rect = CGRectMake(offsetX + b[i].x * scale, offsetY + (b[i].y - lift) * scale,
-                                 b[i].w * scale + 2, b[i].h * scale + 2);
-        NSDictionary *attributes = @{
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:alpha],
-            NSParagraphStyleAttributeName: paragraph,
-        };
-        NSString *text = texts[b[i].index];
-        if (!mask) {
-            [text drawInRect:rect withAttributes:attributes];
-            continue;
-        }
-        // Where the feather sits in this word's own row.
-        CGFloat local = b[i].x + (cursor - b[i].flow);
-        CGFloat start = local - kFillEdge / 2, end = local + kFillEdge / 2;
-        if (b[i].x + b[i].w <= start) {
-            [text drawInRect:rect withAttributes:attributes];
-            continue;
-        }
-        if (b[i].x >= end) continue;
-
-        CGFloat solid = MIN(b[i].x + b[i].w, start);
-        if (solid > b[i].x) {
-            CGContextSaveGState(c);
-            CGContextClipToRect(c, CGRectMake(offsetX + b[i].x * scale, offsetY + (b[i].y - lift) * scale,
-                                              (solid - b[i].x) * scale, b[i].h * scale));
-            [text drawInRect:rect withAttributes:attributes];
-            CGContextRestoreGState(c);
-        }
-        CGContextSaveGState(c);
-        CGContextClipToMask(c, CGRectMake(offsetX + start * scale, offsetY + (b[i].y - lift) * scale,
-                                          kFillEdge * scale, b[i].h * scale), mask);
-        [text drawInRect:rect withAttributes:attributes];
-        CGContextRestoreGState(c);
+        [texts[b[i].index] drawInRect:CGRectMake(offsetX + b[i].x * scale, offsetY + b[i].y * scale,
+                                                 b[i].w * scale + 2, b[i].h * scale + 2)
+                       withAttributes:attributes];
     }
 }
 
-// A whole line drawn on its own at full white, and the same blurred: what an inactive line is shown
-// as. Both are made once per clip; the active one is drawn afresh every frame for the sweep.
+// A whole line drawn on its own at full white. `lineScale` is 1 for the line being sung and 0.97 for
+// the ones either side, which the app steps back so the sung one reads as the page's focus.
 static UIImage *lineImage(NSData *boxes, NSArray<NSString *> *texts, UIFont *font,
-                          CGFloat pageWidth, CGFloat height, CGFloat scale, CGFloat pad) {
+                          CGFloat pageWidth, CGFloat height, CGFloat scale, CGFloat pad,
+                          CGFloat lineScale) {
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
     format.scale = 1;
     format.opaque = NO;
     CGSize size = CGSizeMake(pageWidth * scale, height * scale + pad * 2 * scale);
     return [[[UIGraphicsImageRenderer alloc] initWithSize:size format:format] imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        // A line that is not being sung sits at 0.97, anchored at the text edge it reads from, so it
-        // steps back without drifting off the margin.
         CGContextRef c = context.CGContext;
         CGContextTranslateCTM(c, kMargin * scale, pad * scale);
-        CGContextScaleCTM(c, kDimScale, kDimScale);
-        drawLineWords(c, boxes, texts, font, -kMargin * scale, 0, scale, 0, 0, NULL, 1.0);
+        CGContextScaleCTM(c, lineScale, lineScale);
+        drawLineWords(c, boxes, texts, font, -kMargin * scale, 0, scale);
     }];
+}
+
+// A line onto a frame: dim underneath, and the lit copy above it through the playhead's feather.
+// Every word is a copy of the line's picture, so a frame costs a dozen blits and no type at all.
+static void drawSungLine(CGContextRef c, UIImage *sharp, NSData *boxes, CGFloat offsetY,
+                         CGFloat scale, CGFloat cursor, CGImageRef feather, BOOL swept, CGFloat fade) {
+    if (!sharp) return;
+    CGRect rect = CGRectMake(0, offsetY, sharp.size.width, sharp.size.height);
+    [sharp drawInRect:rect blendMode:kCGBlendModeNormal alpha:kDimAlpha];
+    if (!swept) {
+        if (fade > 0) [sharp drawInRect:rect blendMode:kCGBlendModeNormal alpha:fade];
+        return;
+    }
+    const SGWordBox *b = boxes.bytes;
+    NSUInteger n = boxes.length / sizeof(SGWordBox);
+    for (NSUInteger i = 0; i < n; i++) {
+        CGFloat heard = cursor - b[i].flow;
+        if (heard <= 0) continue;
+        CGContextSaveGState(c);
+        CGContextClipToRect(c, CGRectMake(b[i].x * scale, offsetY + (kPad + b[i].y) * scale,
+                                          b[i].w * scale, b[i].h * scale));
+        if (heard < b[i].w + kFillEdge / 2) {
+            CGContextClipToMask(c, CGRectMake((b[i].x + heard - kFillEdge / 2) * scale,
+                                              offsetY + (kPad + b[i].y) * scale,
+                                              kFillEdge * scale, b[i].h * scale), feather);
+        }
+        [sharp drawInRect:rect blendMode:kCGBlendModeNormal alpha:1.0];
+        CGContextRestoreGState(c);
+    }
 }
 
 static UIImage *blurred(UIImage *image, CGFloat radius) {
@@ -442,9 +442,8 @@ static BOOL writeClip(NSURL *url, CGSize size, NSTimeInterval seconds, NSTimeInt
             CGContextRef c = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buffer), w, h, 8,
                 CVPixelBufferGetBytesPerRow(buffer), space, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
             if (c) {
-                // The buffer is bottom up; turn it over so the image lands the right way.
-                CGContextTranslateCTM(c, 0, h);
-                CGContextScaleCTM(c, 1, -1);
+                // Drawn straight in: a bitmap context already puts the image the right way up, and
+                // turning it over here is what had the whole clip upside down on the lock screen.
                 CGContextDrawImage(c, CGRectMake(0, 0, w, h), image.CGImage);
                 CGContextRelease(c);
             }
@@ -606,16 +605,19 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
     UIImage *wash = washImage(coverImage(size), size);
     UIImage *base = backingImage(wash, size);
 
-    // The lines either side of the run, drawn sharp and blurred while the clip is made: they never
-    // change inside it, and blurring them per frame would cost more than the encoding does.
-    NSInteger low = MAX(0, first - 2), high = MIN((NSInteger)lines.count - 1, first + count + 3);
+    // The lines either side of the run, drawn while the clip is made: they never change inside it,
+    // and blurring or setting type per frame would cost more than everything else put together.
+    NSInteger low = MAX(0, first - 2), high = MIN((NSInteger)lines.count - 1, first + count + 2);
     NSMutableDictionary<NSNumber *, NSArray<UIImage *> *> *still = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, UIImage *> *sharpLines = [NSMutableDictionary dictionary];
     for (NSInteger i = low; i <= high; i++) {
         CGFloat height = heights[i].doubleValue;
-        UIImage *sharp = lineImage(layouts[i], texts[i], drawn, pageWidth, height, scale, kPad);
-        if (!sharp) continue;
-        still[@(i)] = @[blurred(sharp, kBlurPerLine * scale),
-                        blurred(sharp, MIN(kMaxBlur, kBlurPerLine * 2) * scale)];
+        UIImage *sharp = lineImage(layouts[i], texts[i], drawn, pageWidth, height, scale, kPad, 1);
+        UIImage *stepped = lineImage(layouts[i], texts[i], drawn, pageWidth, height, scale, kPad, kDimScale);
+        if (!sharp || !stepped) continue;
+        sharpLines[@(i)] = sharp;
+        still[@(i)] = @[blurred(stepped, kBlurPerLine * scale),
+                        blurred(stepped, MIN(kMaxBlur, kBlurPerLine * 2) * scale)];
     }
 
     CGImageRef mask = featherMask();
@@ -644,7 +646,7 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
                 }
             }
 
-            for (NSInteger i = low; i <= high; i++) {
+            for (NSInteger i = MAX(low, at - 2); i <= MIN(high, at + 3); i++) {
                 if (i == at) continue;
                 NSArray<UIImage *> *variants = still[@(i)];
                 if (!variants) continue;
@@ -654,24 +656,19 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
                 [image drawInRect:CGRectMake(0, y, pageWidth * scale, image.size.height) blendMode:kCGBlendModeNormal alpha:kDimAlpha];
             }
 
-            // The sung line: dim underneath, lit on top through the feather at the playhead.
+            // The sung line: the dim copy under, the lit one above through the playhead's feather.
             NSData *boxes = layouts[at];
             const SGWordBox *words = boxes.bytes;
             NSUInteger n = boxes.length / sizeof(SGWordBox);
-            CGFloat y = (kAnchor * kPageHeight + tops[at].doubleValue - scroll) * scale;
             BOOL swept = NO;
             for (NSUInteger i = 0; i < n; i++) {
                 if (words[i].end > words[i].start) { swept = YES; break; }
             }
-            drawLineWords(c, boxes, texts[at], drawn, 0, y, scale, ms, 0, NULL, kDimAlpha);
-            if (swept) {
-                CGFloat cursor = cursorAt(words, n, ms);
-                drawLineWords(c, boxes, texts[at], drawn, 0, y, scale, ms, cursor, mask, 1.0);
-            } else {
-                double since = MAX(0.0, (ms - lines[at].start) / 350.0);
-                CGFloat alpha = MIN(1.0, since);
-                if (alpha > 0) drawLineWords(c, boxes, texts[at], drawn, 0, y, scale, ms, 0, NULL, alpha);
-            }
+            SGWordBox rise = {0, 0, 0, 0, 0, lines[at].start, lines[at].start + 900, 0};
+            CGFloat lift = liftAt(&rise, ms);
+            CGFloat y = (kAnchor * kPageHeight + tops[at].doubleValue - scroll - kPad) * scale - lift * scale;
+            CGFloat fade = MIN(1.0, MAX(0.0, (ms - lines[at].start) / 350.0));
+            drawSungLine(c, sharpLines[@(at)], boxes, y, scale, cursorAt(words, n, ms), mask, swept, fade);
         });
     }
     if (!wrote) return nil;
@@ -687,7 +684,7 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
             [base drawInRect:CGRectMake(0, 0, size.width, size.height)];
             NSInteger at = first;
             CGFloat scroll = tops[at].doubleValue;
-            for (NSInteger i = low; i <= high; i++) {
+            for (NSInteger i = MAX(low, at - 2); i <= MIN(high, at + 3); i++) {
                 if (i == at) continue;
                 NSArray<UIImage *> *variants = still[@(i)];
                 if (!variants) continue;
@@ -698,9 +695,12 @@ static NSDictionary *makeClip(NSArray<SGKaraokeLine *> *lines, NSInteger first, 
             NSData *boxes = layouts[at];
             const SGWordBox *words = boxes.bytes;
             NSUInteger n = boxes.length / sizeof(SGWordBox);
-            CGFloat y = (kAnchor * kPageHeight + tops[at].doubleValue - scroll) * scale;
-            drawLineWords(c, boxes, texts[at], drawn, 0, y, scale, startMs, 0, NULL, kDimAlpha);
-            drawLineWords(c, boxes, texts[at], drawn, 0, y, scale, startMs, cursorAt(words, n, startMs), mask, 1.0);
+            BOOL swept = NO;
+            for (NSUInteger i = 0; i < n; i++) {
+                if (words[i].end > words[i].start) { swept = YES; break; }
+            }
+            CGFloat y = (kAnchor * kPageHeight + tops[at].doubleValue - scroll - kPad) * scale;
+            drawSungLine(c, sharpLines[@(at)], boxes, y, scale, cursorAt(words, n, startMs), mask, swept, 1.0);
         }];
     }
     if (!poster) return nil;
